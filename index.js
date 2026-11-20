@@ -300,6 +300,11 @@ async function deliverFiles(ctx, msgIds, labelName) {
         ...Markup.inlineKeyboard([[Markup.button.url('📤 Share Group with Friends', shareUrl)]])
       }
     ).catch(() => {});
+
+    // Auto-delete the status notice 30s after editing
+    setTimeout(() => {
+      ctx.telegram.deleteMessage(ctx.chat.id, warnMsg.message_id).catch(() => {});
+    }, 30 * 1000);
   }, 5 * 60 * 1000);
 }
 
