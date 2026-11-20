@@ -76,18 +76,17 @@ async function isAdmin(ctx, userId = ctx.from?.id) {
   }
 }
 
-// Auto-delete user message safely (skips owner/admins)
 function scheduleUserMessageDelete(ctx, delayMs) {
-  const userId = ctx.from?.id;
   const msgId = ctx.message?.message_id;
   const chatId = ctx.chat?.id;
-  if (!userId || !msgId || !chatId) return;
-  if (ADMIN_ID && String(userId) === String(ADMIN_ID)) return;
+  if (!msgId || !chatId) return;
 
   setTimeout(async () => {
-    const admin = await isAdmin(ctx, userId);
-    if (!admin) {
-      await ctx.telegram.deleteMessage(chatId, msgId).catch(() => {});
+    try {
+      await ctx.telegram.deleteMessage(chatId, msgId);
+      console.log(`🗑️ Deleted user message ${msgId}`);
+    } catch (e) {
+      console.log(`Could not delete user message ${msgId}:`, e.message);
     }
   }, delayMs);
 }
@@ -108,7 +107,6 @@ async function getUniqueShareMsg(userName, movieName) {
   return FALLBACK_SHARES[Math.floor(Math.random() * FALLBACK_SHARES.length)];
 }
 
-// Helper: Find spelling suggestion or similar movies in DB
 async function findSpellingOrSimilar(query) {
   let aiSuggestion = null;
   try {
@@ -305,9 +303,9 @@ bot.start(async (ctx) => {
   }
 });
 
-// Helper: Build Pro Hyperlink Results UI
+// Helper: Build Stylish Movie Results Message
 async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', botUsername, requester) {
-  const limit = 8;
+  const limit = 6;
   let dbQuery = supabase
     .from('movies_index')
     .select('*', { count: 'exact' })
@@ -323,18 +321,25 @@ async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', b
   if (error || !data || data.length === 0) return null;
 
   const totalPages = Math.ceil(count / limit);
-  let text = `🎬 <b>RESULTS FOR:</b> <code>${escapeHTML(query)}</code> (${count} Files)\n`;
-  text += `👤 <b>REQUESTED BY:</b> ${escapeHTML(requester)}\n`;
-  text += `⚡ <b>POWERED BY:</b> <a href="${GROUP_LINK}">JJ Movies AI</a>\n\n`;
+  const activeFilter = `${qual !== 'ALL' ? ` • ${qual}` : ''}${lang !== 'ALL' ? ` • ${lang}` : ''}`;
+
+  let text = `🎬 <b>${escapeHTML(query.toUpperCase())}</b> • <code>${count} Files${escapeHTML(activeFilter)}</code>\n`;
+  text += `👤 <b>${escapeHTML(requester)}</b>  |  ⚡ <a href="${GROUP_LINK}"><b>JJ Movies AI</b></a>\n`;
+  text += `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n`;
 
   const batchIds = data.slice(0, 5).map(i => i.message_id).join('_');
   const sendAllUrl = `https://t.me/${botUsername}?start=all_${batchIds}`;
 
   data.forEach((item, idx) => {
-    const num = page * limit + idx + 1;
+    const num = String(page * limit + idx + 1).padStart(2, '0');
     const link = `https://t.me/${botUsername}?start=file_${item.message_id}`;
-    text += `<b>${num}.</b> <a href="${link}">[${item.file_size}] ${escapeHTML(item.file_name)}</a>\n\n`;
+    const meta = detectMeta(item.file_name);
+    text += `🔹 <b>${num}.</b> <a href="${link}">${escapeHTML(item.file_name)}</a>\n`;
+    text += `      💾 <code>${escapeHTML(item.file_size)}</code>  •  🎞️ <code>${escapeHTML(item.quality || meta.quality)}</code>  •  🔊 <code>${escapeHTML(item.language || meta.language)}</code>\n\n`;
   });
+
+  text += `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n`;
+  text += `👇 <i>Tap any movie title above to receive in DM</i>`;
 
   const qShort = query.slice(0, 18);
   const buttons = [
@@ -349,7 +354,7 @@ async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', b
       Markup.button.callback(lang === 'Telugu' ? '✅ Tel' : 'Telugu', `f|${qShort}|0|${qual}|Telugu`),
       Markup.button.callback(lang === 'Hindi' ? '✅ Hin' : 'Hindi', `f|${qShort}|0|${qual}|Hindi`),
       Markup.button.callback(lang === 'Tamil' ? '✅ Tam' : 'Tamil', `f|${qShort}|0|${qual}|Tamil`),
-      Markup.button.callback(lang === 'ALL' ? '✅ All' : 'All Lang', `f|${qShort}|0|${qual}|ALL`)
+      Markup.button.callback(lang === 'ALL' ? '✅ All Lang' : 'All Lang', `f|${qShort}|0|${qual}|ALL`)
     ]
   ];
 
@@ -378,7 +383,7 @@ Is the user asking for a movie, web series, or anime?
     const aiOut = result.response.text().trim().replace(/['"]/g, '');
 
     if (aiOut.toUpperCase() === 'NONE') {
-      scheduleUserMessageDelete(ctx, 30 * 1000);
+      scheduleUserMessageDelete(ctx, 20 * 1000);
       return;
     }
     if (aiOut && aiOut.length < 50) searchKeyword = aiOut;
@@ -396,22 +401,23 @@ Is the user asking for a movie, web series, or anime?
     ctx.react('👀').catch(() => {});
     const { aiSuggestion, similarRows } = await findSpellingOrSimilar(userText);
 
-    let msgText = `🤔 <b>"${escapeHTML(userText)}"</b> mana database lo dorakaledu mawa.\n`;
-    msgText += `✍️ <i>Spelling mistake emo oka sari check chey!</i>\n`;
+    let msgText = `🔎 <b>"${escapeHTML(userText)}"</b> not found in library.\n`;
+    msgText += `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n`;
+    msgText += `✍️ <i>Spelling mistake emo oka sari check chey mawa!</i>\n`;
 
     if (aiSuggestion) {
       msgText += `\n💡 <b>Did you mean:</b> <code>${escapeHTML(aiSuggestion)}</code>?`;
     }
 
     if (similarRows.length > 0) {
-      msgText += `\n\n📂 <b>Database lo unna close files:</b>\n`;
+      msgText += `\n\n📂 <b>Close matches found:</b>\n`;
       similarRows.forEach((row, i) => {
         const link = `https://t.me/${ctx.botInfo.username}?start=file_${row.message_id}`;
-        msgText += `<b>${i + 1}.</b> <a href="${link}">[${row.file_size}] ${escapeHTML(row.file_name)}</a>\n`;
+        msgText += `🔹 <b>0${i + 1}.</b> <a href="${link}">${escapeHTML(row.file_name)}</a>\n      💾 <code>${escapeHTML(row.file_size)}</code>\n`;
       });
     }
 
-    msgText += `\nLekapothe kindha button click chesi Admin ki request pampu!`;
+    msgText += `\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n📩 <i>Leka pothe kindha button click chesi Admin ki request pampu.</i>`;
 
     const notFoundMsg = await ctx.reply(msgText, {
       parse_mode: 'HTML',
@@ -420,8 +426,8 @@ Is the user asking for a movie, web series, or anime?
       ...Markup.inlineKeyboard([[Markup.button.callback('📩 Request Admin', `req|${userText.slice(0, 35)}`)]])
     });
 
-    setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, notFoundMsg.message_id).catch(() => {}), 25 * 1000);
-    scheduleUserMessageDelete(ctx, 25 * 1000);
+    setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, notFoundMsg.message_id).catch(() => {}), 20 * 1000);
+    scheduleUserMessageDelete(ctx, 20 * 1000);
     return;
   }
 
@@ -435,8 +441,8 @@ Is the user asking for a movie, web series, or anime?
     ...res.keyboard
   });
 
-  setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, resultMsg.message_id).catch(() => {}), 2 * 60 * 1000);
-  scheduleUserMessageDelete(ctx, 2 * 60 * 1000);
+  setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, resultMsg.message_id).catch(() => {}), 60 * 1000);
+  scheduleUserMessageDelete(ctx, 60 * 1000);
 });
 
 // 8. CALLBACK HANDLERS (Filters, Pagination & Real Admin Request)
