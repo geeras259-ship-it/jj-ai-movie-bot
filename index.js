@@ -52,6 +52,20 @@ function detectMeta(name) {
   };
 }
 
+function extractMovieTitle(rawCaption, fallbackFileName) {
+  if (rawCaption && rawCaption.trim()) {
+    const lines = rawCaption
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(l =>
+        l.length > 0 &&
+        !/^(💾|⏰|📦|🎬|📢)?\s*(size|duration)\s*:/i.test(l)
+      );
+    if (lines.length > 0) return lines[0];
+  }
+  return (fallbackFileName || 'Unknown Movie').replace(/\n/g, ' ').trim();
+}
+
 async function isAdmin(ctx) {
   try {
     const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
@@ -77,8 +91,14 @@ async function getUniqueShareMsg(userName, movieName) {
   return FALLBACK_SHARES[Math.floor(Math.random() * FALLBACK_SHARES.length)];
 }
 
-// 2. /stats COMMAND (Shows exact error if DB fails)
+// 2. /stats COMMAND (Admin Only)
 bot.command('stats', async (ctx) => {
+  const userId = String(ctx.from?.id || '');
+  const isOwner = ADMIN_ID && userId === String(ADMIN_ID);
+  const chatAdmin = ctx.chat?.type !== 'private' ? await isAdmin(ctx) : false;
+
+  if (!isOwner && !chatAdmin) return;
+
   const { data, count, error } = await supabase
     .from('movies_index')
     .select('*', { count: 'exact' });
@@ -102,8 +122,7 @@ bot.on('channel_post', async (ctx) => {
   const file = post.document || post.video;
   if (!file) return;
 
-  const rawName = post.caption || file.file_name || 'Unknown Movie';
-  const cleanName = rawName.replace(/\n/g, ' ').trim();
+  const cleanName = extractMovieTitle(post.caption, file.file_name);
   const fileSize = formatSize(file.file_size);
   const { quality, language } = detectMeta(cleanName);
 
