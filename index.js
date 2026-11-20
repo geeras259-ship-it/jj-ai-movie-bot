@@ -87,10 +87,12 @@ bot.command('stats', async (ctx) => {
   ctx.reply(`📊 <b>JJ AI BOT STATS</b>\n\n🎬 <b>Total Indexed Files:</b> <code>${count || 0}</code>\n⚡ <b>Status:</b> Online & Ready`, { parse_mode: 'HTML' });
 });
 
-// 3. AUTO-INDEXING (DB Channel -> Supabase)
+// 3. AUTO-INDEXING (DB Channel -> Supabase with safe ID normalization)
 bot.on('channel_post', async (ctx) => {
   const post = ctx.channelPost;
-  if (String(post.chat.id) !== String(DB_CHANNEL_ID)) return;
+  const incomingId = String(post.chat.id).replace(/^-100/, '');
+  const expectedId = String(DB_CHANNEL_ID).replace(/^-100/, '');
+  if (incomingId !== expectedId) return;
 
   const file = post.document || post.video;
   if (!file) return;
