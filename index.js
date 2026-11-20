@@ -15,7 +15,8 @@ const aiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
 const DB_CHANNEL_ID = (process.env.DB_CHANNEL_ID || '-1004324049481').trim();
 const GROUP_LINK = (process.env.GROUP_LINK || 'https://t.me/+QHmHTKoJButkMzNl').trim();
 const ADMIN_ID = String(process.env.ADMIN_ID || '1293174588').trim();
-const TARGET_GROUP_ID = String(process.env.GROUP_ID || '').trim(); // Optional: '-100xxxxxxxxxx'
+const TARGET_GROUP_ID = String(process.env.GROUP_ID || '').trim();
+const TMDB_API_KEY = (process.env.TMDB_API_KEY || '').trim();
 
 const SUCCESS_REACTIONS = ['🔥', '🎬', '⚡', '🤩', '🍿'];
 const VIBES = [
@@ -30,6 +31,43 @@ const FALLBACK_SHARES = [
   '🎬 Popcorn ready chesko mawa! Nachithe mana group link ni mee gang ki forward chey! 🚀',
   '🔥 Mass print ichanu mawa! Full enjoy chesi, mana group ni friends ki share cheyadam marchipoku! ✌️'
 ];
+
+// Dynamic Multi-Supabase & Channels State
+let extraDbs = []; // [{ url, key, client }]
+let channels = {
+  db: [],      // Storage channels
+  marvel: [],  // Marvel & DC
+  series: [],  // Web Series
+  dubbed: [],  // Hollywood Telugu Dubbed
+  telugu: []   // Telugu & Remaining
+};
+const adminState = new Map();
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Load Dynamic DBs & Channels from Main Supabase
+async function loadDynamicConfig() {
+  try {
+    const { data: dbs } = await supabase.from('bot_databases').select('*');
+    extraDbs = (dbs || []).map((d) => ({
+      url: d.url,
+      key: d.anon_key,
+      client: createClient(d.url, d.anon_key)
+    }));
+
+    const { data: chs } = await supabase.from('bot_channels').select('*');
+    channels = { db: [], marvel: [], series: [], dubbed: [], telugu: [] };
+    for (const c of chs || []) {
+      if (channels[c.channel_type]) {
+        channels[c.channel_type].push(String(c.channel_id));
+      }
+    }
+    console.log(`✅ Loaded ${extraDbs.length} extra DBs and ${(chs || []).length} channels.`);
+  } catch (err) {
+    console.error('Config Load Error:', err.message);
+  }
+}
+loadDynamicConfig();
 
 // Helpers
 function formatSize(bytes) {
@@ -50,14 +88,15 @@ function getRequesterDisplay(ctx) {
   return 'Member';
 }
 
+// Strict Private DM + Owner Lock (Silent ignore for non-owners or group chats)
+function isOwnerDM(ctx) {
+  return ctx.chat?.type === 'private' && String(ctx.from?.id || '') === ADMIN_ID;
+}
+
 // Checks Owner ID, Anonymous Group Admin (sender_chat), or Telegram Group Admin
 async function isAdmin(ctx, userId = ctx.from?.id) {
-  // 1. Owner personal account check
-  if (ADMIN_ID && userId && String(userId) === ADMIN_ID) {
-    return true;
-  }
+  if (ADMIN_ID && userId && String(userId) === ADMIN_ID) return true;
 
-  // 2. Anonymous Admin posting as Group/Channel (sender_chat)
   const senderChat = ctx.message?.sender_chat || ctx.callbackQuery?.message?.sender_chat;
   if (senderChat) {
     if (TARGET_GROUP_ID) {
@@ -69,7 +108,6 @@ async function isAdmin(ctx, userId = ctx.from?.id) {
     }
   }
 
-  // 3. Normal Telegram group admin check
   if (!userId || !ctx.chat || ctx.chat.type === 'private') return false;
   try {
     const member = await ctx.telegram.getChatMember(ctx.chat.id, userId);
@@ -110,6 +148,73 @@ function extractMovieTitle(rawCaption, fallbackFileName) {
   return (fallbackFileName || 'Unknown Movie').replace(/\n/g, ' ').trim();
 }
 
+function parseFileMeta(rawName) {
+  const cleanStr = (rawName || '').replace(/\.(mkv|mp4|avi|mov)$/i, '').replace(/[\._]/g, ' ');
+  const isSeries = /\b(S\d{1,2}|Season\s*\d{1,2}|E\d{1,2}|EP\s*\d{1,2})\b/i.test(cleanStr);
+  const seasonMatch = cleanStr.match(/\b(?:S|Season\s*)0?(\d{1,2})\b/i);
+  const seasonNum = seasonMatch ? parseInt(seasonMatch[1], 10) : null;
+
+  const yearMatch = cleanStr.match(/\b(19\d{2}|20\d{2})\b/);
+  const year = yearMatch ? yearMatch[1] : null;
+
+  const langs = [];
+  if (/telugu|tel\b/i.test(cleanStr)) langs.push('Telugu');
+  if (/tamil|tam\b/i.test(cleanStr)) langs.push('Tamil');
+  if (/hindi|hin\b/i.test(cleanStr)) langs.push('Hindi');
+  if (/english|eng\b/i.test(cleanStr)) langs.push('English');
+  if (/malayalam|mal\b/i.test(cleanStr)) langs.push('Malayalam');
+  if (/kannada|kan\b/i.test(cleanStr)) langs.push('Kannada');
+
+  const qualMatch = cleanStr.match(/\b(480p|720p|1080p|2160p|4K)\b/i);
+  const quality = qualMatch ? qualMatch[1].toUpperCase() : 'HD';
+
+  let title = cleanStr
+    .replace(/\b(19\d{2}|20\d{2})\b.*/i, '')
+    .replace(/\b(S\d{1,2}.*|Season\s*\d+.*|480p.*|720p.*|1080p.*|WEB-DL.*|HDRip.*|BluRay.*|HQ.*|PreDVD.*)/i, '')
+    .replace(/[\(\)\[\]\-–—]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!title || title.length < 2) title = cleanStr.slice(0, 35).trim();
+
+  const groupKey = `${title.toLowerCase().replace(/[^a-z0-9]/g, '')}_${year || 'na'}${isSeries && seasonNum ? `_s${seasonNum}` : ''}`;
+  return { title, year, langs, quality, isSeries, seasonNum, groupKey };
+}
+
+async function fetchTmdbInfo(title, year, isSeries) {
+  if (!TMDB_API_KEY) return null;
+  try {
+    const type = isSeries ? 'tv' : 'movie';
+    const yearParam = year ? (isSeries ? `&first_air_date_year=${year}` : `&year=${year}`) : '';
+    const searchUrl = `https://api.themoviedb.org/3/search/${type}?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(title)}${yearParam}`;
+    const res = await fetch(searchUrl);
+    const data = await res.json();
+    const first = data.results?.[0];
+    if (!first) return null;
+
+    const detailUrl = `https://api.themoviedb.org/3/${type}/${first.id}?api_key=${TMDB_API_KEY}`;
+    const detRes = await fetch(detailUrl);
+    const det = await detRes.json();
+
+    const companies = (det.production_companies || []).map((c) => c.name.toLowerCase());
+    const networks = (det.networks || []).map((n) => n.name.toLowerCase());
+    const combinedText = `${det.title || det.name || ''} ${det.overview || ''} ${companies.join(' ')} ${networks.join(' ')}`.toLowerCase();
+
+    const isMarvelOrDc = /(marvel|dc films|dc entertainment|dc studios|avengers|spider-man|batman|superman|deadpool|wolverine|thunderbolts|loki|daredevil|peacemaker|joker|aquaman|flash|iron man|thor|captain america|x-men)/i.test(combinedText);
+
+    return {
+      title: det.title || det.name || title,
+      year: (det.release_date || det.first_air_date || year || '').slice(0, 4),
+      originalLang: det.original_language || '',
+      posterUrl: det.poster_path ? `https://image.tmdb.org/t/p/w500${det.poster_path}` : null,
+      isMarvelOrDc
+    };
+  } catch (err) {
+    console.error('TMDB Error:', err.message);
+    return null;
+  }
+}
+
 function scheduleUserMessageDelete(ctx, delayMs) {
   const msgId = ctx.message?.message_id;
   const chatId = ctx.chat?.id;
@@ -118,10 +223,7 @@ function scheduleUserMessageDelete(ctx, delayMs) {
   setTimeout(async () => {
     try {
       await ctx.telegram.deleteMessage(chatId, msgId);
-      console.log(`🗑️ Deleted message ${msgId}`);
-    } catch (e) {
-      console.log(`Could not delete message ${msgId}:`, e.message);
-    }
+    } catch (e) {}
   }, delayMs);
 }
 
@@ -166,7 +268,7 @@ async function findSpellingOrSimilar(query) {
   return { aiSuggestion, similarRows };
 }
 
-// 2. /stats COMMAND (Admin / Owner Only)
+// ================= OWNER-ONLY PRIVATE DM COMMANDS =================
 bot.command('stats', async (ctx) => {
   const allowed = await isAdmin(ctx);
   if (!allowed) return;
@@ -179,17 +281,174 @@ bot.command('stats', async (ctx) => {
     return ctx.reply(`❌ DB Error: <code>${escapeHTML(error.message)}</code>`, { parse_mode: 'HTML' });
   }
   ctx.reply(
-    `📊 <b>JJ AI BOT STATS</b>\n\n🎬 <b>Total Indexed Files:</b> <code>${count ?? data?.length ?? 0}</code>\n⚡ <b>Status:</b> Online & Ready`,
+    `📊 <b>JJ AI BOT STATS</b>\n\n🎬 <b>Total Indexed Files:</b> <code>${count ?? data?.length ?? 0}</code>\n🗄️ <b>Extra DBs:</b> <code>${extraDbs.length}</code>\n⚡ <b>Status:</b> Online & Ready`,
     { parse_mode: 'HTML' }
   );
 });
 
-// 3. AUTO-INDEXING (DB Channel -> Supabase with safe ID normalization)
+bot.command('addchannel', (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  ctx.reply('📢 <b>Select Channel Category to Add:</b>', {
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('🦸 Marvel & DC', 'addch_marvel'), Markup.button.callback('📺 Web Series', 'addch_series')],
+      [Markup.button.callback('🗣️ Telugu Dubbed (Hollywood)', 'addch_dubbed')],
+      [Markup.button.callback('🎬 Telugu & Remaining', 'addch_telugu')],
+      [Markup.button.callback('🗄️ Storage (DB Channel)', 'addch_db')]
+    ])
+  });
+});
+
+bot.command('channels', (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  const text =
+    `📢 <b>Connected Channels:</b>\n\n` +
+    `🗄️ <b>Storage (DB):</b> ${channels.db.join(', ') || DB_CHANNEL_ID}\n` +
+    `🦸 <b>Marvel & DC:</b> ${channels.marvel.join(', ') || 'None'}\n` +
+    `📺 <b>Web Series:</b> ${channels.series.join(', ') || 'None'}\n` +
+    `🗣️ <b>Telugu Dubbed:</b> ${channels.dubbed.join(', ') || 'None'}\n` +
+    `🎬 <b>Telugu/Remaining:</b> ${channels.telugu.join(', ') || 'None'}\n\n` +
+    `Remove cheyadaniki: <code>/delchannel -100xxxx</code>`;
+  ctx.reply(text, { parse_mode: 'HTML' });
+});
+
+bot.command('delchannel', async (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  const chId = ctx.message.text.replace('/delchannel', '').trim();
+  if (!/^-?\d+$/.test(chId)) return ctx.reply('❌ Usage: <code>/delchannel -1001234567890</code>', { parse_mode: 'HTML' });
+
+  await supabase.from('bot_channels').delete().eq('channel_id', chId);
+  await loadDynamicConfig();
+  ctx.reply(`🗑️ Channel <code>${chId}</code> removed.`, { parse_mode: 'HTML' });
+});
+
+bot.command('adddb', (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  adminState.set(ctx.chat.id, { action: 'awaiting_db' });
+  ctx.reply('🗄️ Kotha Supabase details ila pampandi:\n\n<code>SUPABASE_URL SUPABASE_ANON_KEY</code>', { parse_mode: 'HTML' });
+});
+
+bot.command('listdb', (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  const list = extraDbs.map((d, i) => `${i + 1}. ${d.url}`).join('\n') || 'No extra DBs added.';
+  ctx.reply(`🗄️ <b>Active Databases:</b>\n\n<b>Main:</b> ${process.env.SUPABASE_URL || 'Default'}\n\n<b>Extra:</b>\n${escapeHTML(list)}`, { parse_mode: 'HTML' });
+});
+
+// ================= TMDB 4-CHANNEL AUTO-POSTER =================
+bot.command('autopost', async (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  await ctx.reply('🔄 Scanning all Supabase DBs & grouping movies/series...');
+
+  let allFiles = [];
+  const dbsToRead = [supabase, ...extraDbs.map((d) => d.client)];
+  for (const client of dbsToRead) {
+    const { data } = await client.from('movies_index').select('file_name, message_id, channel_id').limit(5000);
+    if (data) allFiles = allFiles.concat(data);
+  }
+
+  if (allFiles.length === 0) {
+    return ctx.reply('❌ Supabase lo files em levu.');
+  }
+
+  const groups = new Map();
+  for (const f of allFiles) {
+    if (!f.message_id) continue;
+    const chId = String(f.channel_id || DB_CHANNEL_ID);
+    const meta = parseFileMeta(f.file_name);
+    if (!groups.has(meta.groupKey)) {
+      groups.set(meta.groupKey, {
+        meta,
+        langs: new Set(meta.langs),
+        qualities: new Set([meta.quality]),
+        items: []
+      });
+    }
+    const g = groups.get(meta.groupKey);
+    meta.langs.forEach((l) => g.langs.add(l));
+    g.qualities.add(meta.quality);
+    g.items.push({ channel_id: chId, message_id: f.message_id });
+  }
+
+  const { data: existing } = await supabase.from('movie_batches').select('movie_key').eq('posted', true);
+  const postedKeys = new Set((existing || []).map((e) => e.movie_key));
+
+  let postedCount = 0;
+
+  for (const [movieKey, g] of groups.entries()) {
+    if (postedKeys.has(movieKey)) continue;
+
+    const tmdb = await fetchTmdbInfo(g.meta.title, g.meta.year, g.meta.isSeries);
+    const finalTitle = tmdb?.title || g.meta.title;
+    const finalYear = tmdb?.year || g.meta.year || 'N/A';
+    const langsArr = Array.from(g.langs);
+    const langsText = langsArr.length > 0 ? langsArr.join(', ') : 'Telugu';
+    const qualsText = Array.from(g.qualities).join(', ');
+
+    // Priority: 1. Marvel/DC -> 2. Web Series -> 3. Hollywood Telugu Dubbed -> 4. Telugu/Remaining
+    let targetType = 'telugu';
+    if (tmdb?.isMarvelOrDc) {
+      targetType = 'marvel';
+    } else if (g.meta.isSeries) {
+      targetType = 'series';
+    } else if (tmdb?.originalLang === 'en' && langsArr.includes('Telugu')) {
+      targetType = 'dubbed';
+    }
+
+    const targetChannels = channels[targetType]?.length > 0 ? channels[targetType] : channels.telugu;
+    if (!targetChannels || targetChannels.length === 0) continue;
+
+    const batchCode = `b_${Date.now().toString(36)}${Math.floor(Math.random() * 90 + 10)}`;
+    const deepLink = `https://t.me/${ctx.botInfo.username}?start=${batchCode}`;
+
+    const { error: saveErr } = await supabase.from('movie_batches').upsert({
+      batch_code: batchCode,
+      movie_key: movieKey,
+      movie_title: finalTitle,
+      file_items: g.items,
+      posted: true
+    }, { onConflict: 'movie_key' });
+
+    if (saveErr) {
+      console.error('Batch Save Error:', saveErr.message);
+      continue;
+    }
+
+    const seasonTag = g.meta.isSeries && g.meta.seasonNum ? ` - Season ${g.meta.seasonNum}` : '';
+    const caption =
+      `🎬 <b>${escapeHTML(finalTitle)}${seasonTag} (${escapeHTML(finalYear)})</b>\n\n` +
+      `📅 <b>Year:</b> ${escapeHTML(finalYear)}\n` +
+      `🔊 <b>Languages:</b> ${escapeHTML(langsText)}\n` +
+      `🎞️ <b>Qualities:</b> ${escapeHTML(qualsText)}\n` +
+      `📂 <b>Total Files:</b> ${g.items.length}`;
+
+    const keyboard = Markup.inlineKeyboard([[Markup.button.url('⚡ Download All Files', deepLink)]]);
+
+    for (const targetCh of targetChannels) {
+      try {
+        if (tmdb?.posterUrl) {
+          await ctx.telegram.sendPhoto(targetCh, tmdb.posterUrl, { caption, parse_mode: 'HTML', ...keyboard });
+        } else {
+          await ctx.telegram.sendMessage(targetCh, caption, { parse_mode: 'HTML', ...keyboard });
+        }
+      } catch (err) {
+        console.error(`Post failed for ${finalTitle} in ${targetCh}:`, err.message);
+      }
+      await sleep(5000); // Safe 5s delay
+    }
+
+    postedCount++;
+  }
+
+  ctx.reply(`✅ Auto-Post Complete! Total new posts: <b>${postedCount}</b>`, { parse_mode: 'HTML' });
+});
+
+// ================= AUTO-INDEXING (STORAGE CHANNELS -> SUPABASE) =================
 bot.on('channel_post', async (ctx) => {
   const post = ctx.channelPost;
-  const incomingId = String(post.chat.id).replace(/^-100/, '');
-  const expectedId = String(DB_CHANNEL_ID).replace(/^-100/, '');
-  if (incomingId !== expectedId) return;
+  const incomingClean = String(post.chat.id).replace(/^-100/, '');
+  const allowedCleanIds = [DB_CHANNEL_ID, ...channels.db].map(id => String(id).replace(/^-100/, ''));
+
+  if (!allowedCleanIds.includes(incomingClean)) return;
 
   const file = post.document || post.video;
   if (!file) return;
@@ -198,19 +457,27 @@ bot.on('channel_post', async (ctx) => {
   const fileSize = formatSize(file.file_size);
   const { quality, language } = detectMeta(cleanName);
 
-  const { error } = await supabase.from('movies_index').upsert({
+  const record = {
     message_id: post.message_id,
+    channel_id: String(post.chat.id),
     file_name: cleanName,
     file_size: fileSize,
     quality,
     language
-  }, { onConflict: 'message_id' });
+  };
 
-  if (error) console.error('Supabase Insert Error:', error.message);
-  else console.log(`✅ Indexed: ${cleanName} (${fileSize})`);
+  const { error } = await supabase.from('movies_index').upsert(record, { onConflict: 'message_id' });
+  if (error && extraDbs.length > 0) {
+    for (const db of extraDbs) {
+      const res = await db.client.from('movies_index').upsert(record, { onConflict: 'message_id' });
+      if (!res.error) break;
+    }
+  } else if (!error) {
+    console.log(`✅ Indexed: ${cleanName} (${fileSize})`);
+  }
 });
 
-// 4. AUTO-WELCOME + DELETE JOIN SERVICE MESSAGE
+// ================= AUTO-WELCOME + LINK GUARD =================
 bot.on('new_chat_members', async (ctx) => {
   ctx.deleteMessage().catch(() => {});
   for (const member of ctx.message.new_chat_members) {
@@ -223,7 +490,6 @@ bot.on('new_chat_members', async (ctx) => {
   }
 });
 
-// 5. LINK GUARD: Allow Admins / Anonymous Group Links, Delete Non-Admin Links
 bot.use(async (ctx, next) => {
   if (!ctx.message || ctx.chat?.type === 'private') return next();
 
@@ -239,16 +505,18 @@ bot.use(async (ctx, next) => {
       return;
     }
   }
-
   return next();
 });
 
-// Helper: Send Single or Multiple Files with Blue Group Link Captions + 5-Min Auto-Delete
-async function deliverFiles(ctx, msgIds, labelName) {
+// ================= FILE DELIVERY (SINGLE, SEND ALL & BATCH) =================
+async function deliverFiles(ctx, items, labelName) {
   const sentIds = [];
   let lastTitle = 'Movie';
 
-  for (const msgId of msgIds) {
+  for (const item of items) {
+    const msgId = typeof item === 'object' ? item.message_id : item;
+    const chId = typeof item === 'object' && item.channel_id ? item.channel_id : DB_CHANNEL_ID;
+
     try {
       const { data: movie } = await supabase
         .from('movies_index')
@@ -264,11 +532,12 @@ async function deliverFiles(ctx, msgIds, labelName) {
         (movie?.file_size ? `💾 <a href="${GROUP_LINK}"><b>Size: ${escapeHTML(movie.file_size)}</b></a>\n\n` : '') +
         `📢 <a href="${GROUP_LINK}"><b>Join Our Movies Group</b></a>`;
 
-      const sent = await ctx.telegram.copyMessage(ctx.chat.id, DB_CHANNEL_ID, msgId, {
+      const sent = await ctx.telegram.copyMessage(ctx.chat.id, chId, msgId, {
         caption: customCaption,
         parse_mode: 'HTML'
       });
       sentIds.push(sent.message_id);
+      await sleep(800);
     } catch (e) {
       console.log(`Failed to send msgId ${msgId}:`, e.message);
     }
@@ -301,14 +570,13 @@ async function deliverFiles(ctx, msgIds, labelName) {
       }
     ).catch(() => {});
 
-    // Auto-delete the status notice 30s after editing
     setTimeout(() => {
       ctx.telegram.deleteMessage(ctx.chat.id, warnMsg.message_id).catch(() => {});
     }, 30 * 1000);
   }, 5 * 60 * 1000);
 }
 
-// 6. DEEP LINK DELIVERY (Single + SEND ALL) & GEMINI /start
+// ================= DEEP LINK DELIVERY (/start) =================
 bot.start(async (ctx) => {
   const payload = ctx.startPayload;
   const labelName = getRequesterDisplay(ctx);
@@ -329,6 +597,19 @@ bot.start(async (ctx) => {
     }
   }
 
+  if (payload.startsWith('b_')) {
+    const { data: batch } = await supabase
+      .from('movie_batches')
+      .select('*')
+      .eq('batch_code', payload)
+      .single();
+
+    if (!batch || !batch.file_items?.length) {
+      return ctx.reply('❌ Files not found or batch link expired.');
+    }
+    return deliverFiles(ctx, batch.file_items, labelName);
+  }
+
   if (payload.startsWith('file_')) {
     const msgId = parseInt(payload.replace('file_', ''), 10);
     if (!isNaN(msgId)) return deliverFiles(ctx, [msgId], labelName);
@@ -340,7 +621,48 @@ bot.start(async (ctx) => {
   }
 });
 
-// Helper: Build Clean & Minimal Movie Results Message (No User IDs/Names)
+// ================= INTERACTIVE OWNER DM INPUT HANDLER =================
+bot.on('message', async (ctx, next) => {
+  if (!isOwnerDM(ctx)) return next();
+  if (ctx.message.text && ctx.message.text.startsWith('/')) return next();
+
+  const state = adminState.get(ctx.chat.id);
+  if (!state) return next();
+
+  if (state.action === 'awaiting_channel') {
+    let chId = null;
+    if (ctx.message.forward_from_chat && ctx.message.forward_from_chat.type === 'channel') {
+      chId = String(ctx.message.forward_from_chat.id);
+    } else if (ctx.message.text && /^-?\d+$/.test(ctx.message.text.trim())) {
+      chId = ctx.message.text.trim();
+    }
+
+    if (!chId) {
+      return ctx.reply('❌ Invalid Channel ID. Forward a message from the channel or send <code>-100...</code> ID.', { parse_mode: 'HTML' });
+    }
+
+    await supabase.from('bot_channels').upsert({ channel_id: chId, channel_type: state.category }, { onConflict: 'channel_id' });
+    await loadDynamicConfig();
+    adminState.delete(ctx.chat.id);
+    return ctx.reply(`✅ Saved! Channel <code>${chId}</code> added to <b>${state.category.toUpperCase()}</b>.`, { parse_mode: 'HTML' });
+  }
+
+  if (state.action === 'awaiting_db') {
+    const parts = (ctx.message.text || '').trim().split(/\s+/);
+    if (parts.length < 2) {
+      return ctx.reply('❌ Format: <code>SUPABASE_URL SUPABASE_ANON_KEY</code>', { parse_mode: 'HTML' });
+    }
+    const [url, anon_key] = parts;
+    await supabase.from('bot_databases').upsert({ url, anon_key }, { onConflict: 'url' });
+    await loadDynamicConfig();
+    adminState.delete(ctx.chat.id);
+    return ctx.reply('✅ Extra Supabase DB added and active!');
+  }
+
+  return next();
+});
+
+// ================= GROUP SEARCH & FILTERS =================
 async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', botUsername, tagLabel = 'JJ Movies AI') {
   const limit = 6;
   let dbQuery = supabase
@@ -403,20 +725,14 @@ async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', b
   return { text, keyboard: Markup.inlineKeyboard(buttons) };
 }
 
-// 7. SMART AI GROUP SEARCH + DELETE NON-MOVIE / UNWANTED MESSAGES
 bot.on('text', async (ctx) => {
   if (ctx.chat.type === 'private') return;
   const userText = ctx.message.text.trim();
   if (userText.startsWith('/')) return;
 
   const adminUser = await isAdmin(ctx);
+  if (adminUser && containsLink(ctx.message)) return;
 
-  // If Admin / Anonymous Group posts a link or announcement, keep it as-is
-  if (adminUser && containsLink(ctx.message)) {
-    return;
-  }
-
-  // Delete very short messages (except admins)
   if (userText.length < 2) {
     if (!adminUser) scheduleUserMessageDelete(ctx, 10 * 1000);
     return;
@@ -436,12 +752,9 @@ Is the user asking for a movie, web series, or anime?
       return;
     }
     if (aiOut && aiOut.length < 50) searchKeyword = aiOut;
-  } catch (e) {
-    console.log('Gemini intent fallback:', e.message);
-  }
+  } catch (e) {}
 
   let res = await buildSearchMessage(searchKeyword, 0, 'ALL', 'ALL', ctx.botInfo.username, 'JJ Movies AI');
-
   if (!res && searchKeyword.toLowerCase() !== userText.toLowerCase()) {
     res = await buildSearchMessage(userText, 0, 'ALL', 'ALL', ctx.botInfo.username, 'JJ Movies AI');
   }
@@ -452,10 +765,7 @@ Is the user asking for a movie, web series, or anime?
 
     let msgText = `🔎 <b>"${escapeHTML(userText)}"</b> mana database lo dorakaledu mawa.\n`;
     msgText += `✍️ <i>Spelling mistake emo oka sari check chey!</i>\n`;
-
-    if (aiSuggestion) {
-      msgText += `\n💡 <b>Did you mean:</b> <code>${escapeHTML(aiSuggestion)}</code>?`;
-    }
+    if (aiSuggestion) msgText += `\n💡 <b>Did you mean:</b> <code>${escapeHTML(aiSuggestion)}</code>?`;
 
     if (similarRows.length > 0) {
       msgText += `\n\n📂 <b>Close matches found:</b>\n`;
@@ -493,7 +803,15 @@ Is the user asking for a movie, web series, or anime?
   if (!adminUser) scheduleUserMessageDelete(ctx, 60 * 1000);
 });
 
-// 8. CALLBACK HANDLERS (Filters, Pagination & Admin Request)
+// ================= CALLBACK HANDLERS =================
+bot.action(/^addch_(.+)$/, async (ctx) => {
+  if (!isOwnerDM(ctx)) return ctx.answerCbQuery();
+  const category = ctx.match[1];
+  adminState.set(ctx.chat.id, { action: 'awaiting_channel', category });
+  await ctx.answerCbQuery();
+  ctx.reply(`✅ Selected: <b>${category.toUpperCase()}</b>\n\nIppudu aa Channel ID (<code>-100...</code>) pampandi, LEDA aa channel nunchi edo oka message ikkada forward cheyandi.`, { parse_mode: 'HTML' });
+});
+
 bot.action(/^f\|(.+)\|(\d+)\|(.+)\|(.+)$/, async (ctx) => {
   const [, query, pageStr, qual, lang] = ctx.match;
   const res = await buildSearchMessage(query, parseInt(pageStr, 10), qual, lang, ctx.botInfo.username, 'JJ Movies AI');
@@ -509,7 +827,6 @@ bot.action(/^f\|(.+)\|(\d+)\|(.+)\|(.+)$/, async (ctx) => {
 
 bot.action(/^req\|(.+)$/, async (ctx) => {
   const movieName = ctx.match[1];
-
   if (ADMIN_ID) {
     await ctx.telegram.sendMessage(
       ADMIN_ID,
@@ -517,14 +834,13 @@ bot.action(/^req\|(.+)$/, async (ctx) => {
       { parse_mode: 'HTML' }
     ).catch(() => {});
   }
-
   await ctx.answerCbQuery('✅ Request Admin ki pampanu! Twaralo upload avuthundi.', { show_alert: true });
   ctx.deleteMessage().catch(() => {});
 });
 
 bot.action('noop', (ctx) => ctx.answerCbQuery());
 
-// 9. Keep-Alive Server for Render
+// ================= KEEP-ALIVE SERVER =================
 const app = express();
 app.get('/', (req, res) => res.send('JJ AI Movie Bot Pro is Running!'));
 app.listen(process.env.PORT || 3000, () => console.log('Server running...'));
