@@ -32,8 +32,9 @@ const FALLBACK_SHARES = [
   '🔥 Mass print ichanu mawa! Full enjoy chesi, mana group ni friends ki share cheyadam marchipoku! ✌️'
 ];
 
-// Dynamic Multi-Supabase & Channels State
-let extraDbs = []; // [{ url, key, client }]
+// Dynamic Multi-Supabase, Admins & Channels State
+let extraDbs = [];     // [{ url, key, client }]
+let extraAdmins = [];  // ['123456789', ...]
 let channels = {
   db: [],      // Storage channels
   marvel: [],  // Marvel & DC
@@ -45,7 +46,16 @@ const adminState = new Map();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Load Dynamic DBs & Channels from Main Supabase
+// Category Menu Helper
+const channelMenuKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback('🦸 Marvel & DC', 'addch_marvel'), Markup.button.callback('📺 Web Series', 'addch_series')],
+  [Markup.button.callback('🗣️ Telugu Dubbed (Hollywood)', 'addch_dubbed')],
+  [Markup.button.callback('🎬 Telugu & Remaining', 'addch_telugu')],
+  [Markup.button.callback('🗄️ Storage (DB Channel)', 'addch_db')],
+  [Markup.button.callback('❌ Cancel', 'addch_cancel')]
+]);
+
+// Load Dynamic DBs, Channels & Admins from Main Supabase
 async function loadDynamicConfig() {
   try {
     const { data: dbs } = await supabase.from('bot_databases').select('*');
@@ -62,7 +72,11 @@ async function loadDynamicConfig() {
         channels[c.channel_type].push(String(c.channel_id));
       }
     }
-    console.log(`✅ Loaded ${extraDbs.length} extra DBs and ${(chs || []).length} channels.`);
+
+    const { data: admins } = await supabase.from('bot_admins').select('user_id');
+    extraAdmins = (admins || []).map((a) => String(a.user_id));
+
+    console.log(`✅ Loaded ${extraDbs.length} extra DBs, ${(chs || []).length} channels, ${extraAdmins.length} extra admins.`);
   } catch (err) {
     console.error('Config Load Error:', err.message);
   }
@@ -88,14 +102,21 @@ function getRequesterDisplay(ctx) {
   return 'Member';
 }
 
-// Strict Private DM + Owner Lock (Silent ignore for non-owners or group chats)
-function isOwnerDM(ctx) {
+// Main Owner Only (Add/Remove Admins)
+function isMainOwnerDM(ctx) {
   return ctx.chat?.type === 'private' && String(ctx.from?.id || '') === ADMIN_ID;
 }
 
-// Checks Owner ID, Anonymous Group Admin (sender_chat), or Telegram Group Admin
+// Main Owner + Added Admins (DM Admin Panel & Commands)
+function isOwnerDM(ctx) {
+  const uid = String(ctx.from?.id || '');
+  return ctx.chat?.type === 'private' && (uid === ADMIN_ID || extraAdmins.includes(uid));
+}
+
+// Checks Owner, Added Admins, Anonymous Group Admin, or Telegram Group Admin
 async function isAdmin(ctx, userId = ctx.from?.id) {
-  if (ADMIN_ID && userId && String(userId) === ADMIN_ID) return true;
+  const uid = String(userId || '');
+  if (uid && (uid === ADMIN_ID || extraAdmins.includes(uid))) return true;
 
   const senderChat = ctx.message?.sender_chat || ctx.callbackQuery?.message?.sender_chat;
   if (senderChat) {
@@ -268,7 +289,31 @@ async function findSpellingOrSimilar(query) {
   return { aiSuggestion, similarRows };
 }
 
-// ================= OWNER-ONLY PRIVATE DM COMMANDS =================
+function getAdminPanelText() {
+  return (
+    `👑 <b>JJ FILES ADMIN PANEL</b>\n\n` +
+    `• /addchannel - Add Category Channel\n` +
+    `• /channels - View Connected Channels\n` +
+    `• /delchannel - Remove Channel\n` +
+    `• /autopost - Start TMDB Auto-Post\n` +
+    `• /adddb - Add Extra Supabase DB\n` +
+    `• /listdb - View Active DBs\n` +
+    `• /addadmin - Add Bot Admin (Owner)\n` +
+    `• /deladmin - Remove Bot Admin (Owner)\n` +
+    `• /admins - View Admins List\n` +
+    `• /stats - Bot & File Stats`
+  );
+}
+
+// ================= OWNER & ADMIN PRIVATE DM COMMANDS =================
+bot.command('admin', (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  ctx.reply(getAdminPanelText(), {
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard([[Markup.button.callback('📢 Add Channel', 'addch_back')]])
+  });
+});
+
 bot.command('stats', async (ctx) => {
   const allowed = await isAdmin(ctx);
   if (!allowed) return;
@@ -281,21 +326,45 @@ bot.command('stats', async (ctx) => {
     return ctx.reply(`❌ DB Error: <code>${escapeHTML(error.message)}</code>`, { parse_mode: 'HTML' });
   }
   ctx.reply(
-    `📊 <b>JJ AI BOT STATS</b>\n\n🎬 <b>Total Indexed Files:</b> <code>${count ?? data?.length ?? 0}</code>\n🗄️ <b>Extra DBs:</b> <code>${extraDbs.length}</code>\n⚡ <b>Status:</b> Online & Ready`,
+    `📊 <b>JJ AI BOT STATS</b>\n\n🎬 <b>Total Indexed Files:</b> <code>${count ?? data?.length ?? 0}</code>\n🗄️ <b>Extra DBs:</b> <code>${extraDbs.length}</code>\n👮 <b>Extra Admins:</b> <code>${extraAdmins.length}</code>\n⚡ <b>Status:</b> Online & Ready`,
     { parse_mode: 'HTML' }
   );
 });
 
+bot.command('addadmin', async (ctx) => {
+  if (!isMainOwnerDM(ctx)) return;
+  const uid = ctx.message.text.replace('/addadmin', '').trim();
+  if (!/^\d+$/.test(uid)) {
+    return ctx.reply('❌ Usage: <code>/addadmin 1234567890</code>', { parse_mode: 'HTML' });
+  }
+  await supabase.from('bot_admins').upsert({ user_id: uid }, { onConflict: 'user_id' });
+  await loadDynamicConfig();
+  ctx.reply(`✅ Admin <code>${uid}</code> added!`, { parse_mode: 'HTML' });
+});
+
+bot.command('deladmin', async (ctx) => {
+  if (!isMainOwnerDM(ctx)) return;
+  const uid = ctx.message.text.replace('/deladmin', '').trim();
+  if (!/^\d+$/.test(uid)) {
+    return ctx.reply('❌ Usage: <code>/deladmin 1234567890</code>', { parse_mode: 'HTML' });
+  }
+  await supabase.from('bot_admins').delete().eq('user_id', uid);
+  await loadDynamicConfig();
+  ctx.reply(`🗑️ Admin <code>${uid}</code> removed.`, { parse_mode: 'HTML' });
+});
+
+bot.command('admins', (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  const list = extraAdmins.length > 0 ? extraAdmins.map((id, i) => `${i + 1}. <code>${id}</code>`).join('\n') : 'None';
+  ctx.reply(`👑 <b>Main Owner:</b> <code>${ADMIN_ID}</code>\n\n👮 <b>Added Admins:</b>\n${list}`, { parse_mode: 'HTML' });
+});
+
 bot.command('addchannel', (ctx) => {
   if (!isOwnerDM(ctx)) return;
+  adminState.delete(ctx.chat.id);
   ctx.reply('📢 <b>Select Channel Category to Add:</b>', {
     parse_mode: 'HTML',
-    ...Markup.inlineKeyboard([
-      [Markup.button.callback('🦸 Marvel & DC', 'addch_marvel'), Markup.button.callback('📺 Web Series', 'addch_series')],
-      [Markup.button.callback('🗣️ Telugu Dubbed (Hollywood)', 'addch_dubbed')],
-      [Markup.button.callback('🎬 Telugu & Remaining', 'addch_telugu')],
-      [Markup.button.callback('🗄️ Storage (DB Channel)', 'addch_db')]
-    ])
+    ...channelMenuKeyboard
   });
 });
 
@@ -582,6 +651,13 @@ bot.start(async (ctx) => {
   const labelName = getRequesterDisplay(ctx);
 
   if (!payload) {
+    if (isOwnerDM(ctx)) {
+      return ctx.reply(getAdminPanelText(), {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([[Markup.button.callback('📢 Add Channel', 'addch_back')]])
+      });
+    }
+
     await ctx.sendChatAction('typing').catch(() => {});
     const vibe = VIBES[Math.floor(Math.random() * VIBES.length)];
     try {
@@ -804,12 +880,37 @@ Is the user asking for a movie, web series, or anime?
 });
 
 // ================= CALLBACK HANDLERS =================
+bot.action('addch_back', async (ctx) => {
+  if (!isOwnerDM(ctx)) return ctx.answerCbQuery();
+  adminState.delete(ctx.chat.id);
+  await ctx.answerCbQuery();
+  ctx.editMessageText('📢 <b>Select Channel Category to Add:</b>', {
+    parse_mode: 'HTML',
+    ...channelMenuKeyboard
+  }).catch(() => {});
+});
+
+bot.action('addch_cancel', async (ctx) => {
+  if (!isOwnerDM(ctx)) return ctx.answerCbQuery();
+  adminState.delete(ctx.chat.id);
+  await ctx.answerCbQuery('Cancelled');
+  ctx.editMessageText('❌ Channel setup cancelled.').catch(() => {});
+});
+
 bot.action(/^addch_(.+)$/, async (ctx) => {
   if (!isOwnerDM(ctx)) return ctx.answerCbQuery();
   const category = ctx.match[1];
   adminState.set(ctx.chat.id, { action: 'awaiting_channel', category });
   await ctx.answerCbQuery();
-  ctx.reply(`✅ Selected: <b>${category.toUpperCase()}</b>\n\nIppudu aa Channel ID (<code>-100...</code>) pampandi, LEDA aa channel nunchi edo oka message ikkada forward cheyandi.`, { parse_mode: 'HTML' });
+  ctx.editMessageText(
+    `✅ Selected: <b>${category.toUpperCase()}</b>\n\nIppudu aa Channel ID (<code>-100...</code>) pampandi, LEDA aa channel nunchi edo oka message ikkada forward cheyandi.`,
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('⬅️ Back', 'addch_back'), Markup.button.callback('❌ Cancel', 'addch_cancel')]
+      ])
+    }
+  ).catch(() => {});
 });
 
 bot.action(/^f\|(.+)\|(\d+)\|(.+)\|(.+)$/, async (ctx) => {
@@ -845,6 +946,23 @@ const app = express();
 app.get('/', (req, res) => res.send('JJ AI Movie Bot Pro is Running!'));
 app.listen(process.env.PORT || 3000, () => console.log('Server running...'));
 
-bot.launch().then(() => console.log('🚀 JJ AI Movie Bot Pro Started!'));
+bot.launch().then(async () => {
+  console.log('🚀 JJ AI Movie Bot Pro Started!');
+  if (ADMIN_ID) {
+    await bot.telegram.setMyCommands(
+      [
+        { command: 'admin', description: '👑 Admin Panel' },
+        { command: 'addchannel', description: '📢 Add Category Channel' },
+        { command: 'channels', description: '📋 View Channels' },
+        { command: 'autopost', description: '🚀 Start TMDB Auto-Post' },
+        { command: 'adddb', description: '🗄️ Add Extra Supabase DB' },
+        { command: 'listdb', description: '📚 View Active DBs' },
+        { command: 'admins', description: '👮 View Admins List' },
+        { command: 'stats', description: '📊 Bot & File Stats' }
+      ],
+      { scope: { type: 'chat', chat_id: Number(ADMIN_ID) } }
+    ).catch((e) => console.error('Menu setup error:', e.message));
+  }
+});
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
