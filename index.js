@@ -91,6 +91,33 @@ async function getUniqueShareMsg(userName, movieName) {
   return FALLBACK_SHARES[Math.floor(Math.random() * FALLBACK_SHARES.length)];
 }
 
+// Helper: Find spelling suggestion or similar movies in DB
+async function findSpellingOrSimilar(query) {
+  let aiSuggestion = null;
+  try {
+    const prompt = `A user searched for "${query}" in a movie Telegram group. If it looks like a spelling mistake or typo of a real movie/series/anime title, return ONLY the corrected title. If it seems completely valid or unknown, return ONLY NONE.`;
+    const res = await aiModel.generateContent(prompt);
+    const out = res.response.text().trim().replace(/['"]/g, '');
+    if (out && out.toUpperCase() !== 'NONE' && out.toLowerCase() !== query.toLowerCase() && out.length < 60) {
+      aiSuggestion = out;
+    }
+  } catch (e) {}
+
+  // Check partial prefix in DB (first 4 chars if length >= 4)
+  let similarRows = [];
+  if (query.length >= 4) {
+    const prefix = query.slice(0, 4);
+    const { data } = await supabase
+      .from('movies_index')
+      .select('message_id, file_name, file_size')
+      .ilike('file_name', `%${prefix}%`)
+      .limit(3);
+    if (data && data.length > 0) similarRows = data;
+  }
+
+  return { aiSuggestion, similarRows };
+}
+
 // 2. /stats COMMAND (Admin Only)
 bot.command('stats', async (ctx) => {
   const userId = String(ctx.from?.id || '');
@@ -319,7 +346,7 @@ async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', b
   return { text, keyboard: Markup.inlineKeyboard(buttons) };
 }
 
-// 7. SMART AI GROUP SEARCH (Ignores normal chat, only searches movies!)
+// 7. SMART AI GROUP SEARCH (Ignores normal chat + Spelling/Similar hints when not found)
 bot.on('text', async (ctx) => {
   if (ctx.chat.type === 'private') return;
   const userText = ctx.message.text.trim();
@@ -329,7 +356,7 @@ bot.on('text', async (ctx) => {
   try {
     const prompt = `Analyze this Telegram group message: "${userText}"
 Is the user asking for a movie, web series, or anime?
-- If YES: Return ONLY the clean movie/series title (fix spelling mistakes).
+- If YES: Return ONLY the clean movie/series title (fix obvious spelling mistakes).
 - If NO (it's normal chat like "hi", "hello", "bro", "thanks", or a random person's name like "Harish", "Suresh"): Return ONLY the word NONE.`;
     const result = await aiModel.generateContent(prompt);
     const aiOut = result.response.text().trim().replace(/['"]/g, '');
@@ -340,19 +367,41 @@ Is the user asking for a movie, web series, or anime?
     console.log('Gemini intent fallback:', e.message);
   }
 
-  const res = await buildSearchMessage(searchKeyword, 0, 'ALL', 'ALL', ctx.botInfo.username, ctx.from.first_name || 'User');
+  let res = await buildSearchMessage(searchKeyword, 0, 'ALL', 'ALL', ctx.botInfo.username, ctx.from.first_name || 'User');
+
+  // If AI-corrected keyword didn't match, try raw user text once
+  if (!res && searchKeyword.toLowerCase() !== userText.toLowerCase()) {
+    res = await buildSearchMessage(userText, 0, 'ALL', 'ALL', ctx.botInfo.username, ctx.from.first_name || 'User');
+  }
 
   if (!res) {
     ctx.react('👀').catch(() => {});
-    const notFoundMsg = await ctx.reply(
-      `🔍 <b>"${escapeHTML(searchKeyword)}"</b> mana database lo inka ledu mawa.\n\nKindha button click chesi Admin ki request pampu!`,
-      {
-        parse_mode: 'HTML',
-        reply_to_message_id: ctx.message.message_id,
-        ...Markup.inlineKeyboard([[Markup.button.callback('📩 Request Admin', `req|${searchKeyword.slice(0, 35)}`)]])
-      }
-    );
-    setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, notFoundMsg.message_id).catch(() => {}), 20 * 1000);
+    const { aiSuggestion, similarRows } = await findSpellingOrSimilar(userText);
+
+    let msgText = `🤔 <b>"${escapeHTML(userText)}"</b> mana database lo dorakaledu mawa.\n`;
+    msgText += `✍️ <i>Spelling mistake emo oka sari check chey!</i>\n`;
+
+    if (aiSuggestion) {
+      msgText += `\n💡 <b>Did you mean:</b> <code>${escapeHTML(aiSuggestion)}</code>?`;
+    }
+
+    if (similarRows.length > 0) {
+      msgText += `\n\n📂 <b>Database lo unna close files:</b>\n`;
+      similarRows.forEach((row, i) => {
+        const link = `https://t.me/${ctx.botInfo.username}?start=file_${row.message_id}`;
+        msgText += `<b>${i + 1}.</b> <a href="${link}">[${row.file_size}] ${escapeHTML(row.file_name)}</a>\n`;
+      });
+    }
+
+    msgText += `\nLeKAPOTHE kindha button click chesi Admin ki request pampu!`;
+
+    const notFoundMsg = await ctx.reply(msgText, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_to_message_id: ctx.message.message_id,
+      ...Markup.inlineKeyboard([[Markup.button.callback('📩 Request Admin', `req|${userText.slice(0, 35)}`)]])
+    });
+    setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, notFoundMsg.message_id).catch(() => {}), 25 * 1000);
     return;
   }
 
