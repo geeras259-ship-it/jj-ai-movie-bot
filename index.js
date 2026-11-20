@@ -77,14 +77,19 @@ async function getUniqueShareMsg(userName, movieName) {
   return FALLBACK_SHARES[Math.floor(Math.random() * FALLBACK_SHARES.length)];
 }
 
-// 2. /stats COMMAND (Check total indexed movies in Supabase)
+// 2. /stats COMMAND (Shows exact error if DB fails)
 bot.command('stats', async (ctx) => {
-  const { count, error } = await supabase
+  const { data, count, error } = await supabase
     .from('movies_index')
-    .select('*', { count: 'exact', head: true });
+    .select('*', { count: 'exact' });
 
-  if (error) return ctx.reply(`❌ DB Error: ${error.message}`);
-  ctx.reply(`📊 <b>JJ AI BOT STATS</b>\n\n🎬 <b>Total Indexed Files:</b> <code>${count || 0}</code>\n⚡ <b>Status:</b> Online & Ready`, { parse_mode: 'HTML' });
+  if (error) {
+    return ctx.reply(`❌ DB Error: <code>${escapeHTML(error.message)}</code>`, { parse_mode: 'HTML' });
+  }
+  ctx.reply(
+    `📊 <b>JJ AI BOT STATS</b>\n\n🎬 <b>Total Indexed Files:</b> <code>${count ?? data?.length ?? 0}</code>\n⚡ <b>Status:</b> Online & Ready`,
+    { parse_mode: 'HTML' }
+  );
 });
 
 // 3. AUTO-INDEXING (DB Channel -> Supabase with safe ID normalization)
@@ -162,7 +167,6 @@ async function deliverFiles(ctx, msgIds, userName) {
       const rawTitle = movie ? movie.file_name : 'Watch Movie';
       lastTitle = rawTitle;
 
-      // Every file gets blue clickable links pointing to GROUP_LINK
       const customCaption =
         `<a href="${GROUP_LINK}"><b>${escapeHTML(rawTitle)}</b></a>\n\n` +
         (movie?.file_size ? `💾 <a href="${GROUP_LINK}"><b>Size: ${escapeHTML(movie.file_size)}</b></a>\n\n` : '') +
