@@ -303,7 +303,7 @@ bot.start(async (ctx) => {
   }
 });
 
-// Helper: Build Stylish Movie Results Message
+// Helper: Build Clean & Minimal Movie Results Message
 async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', botUsername, requester) {
   const limit = 6;
   let dbQuery = supabase
@@ -321,25 +321,24 @@ async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', b
   if (error || !data || data.length === 0) return null;
 
   const totalPages = Math.ceil(count / limit);
-  const activeFilter = `${qual !== 'ALL' ? ` • ${qual}` : ''}${lang !== 'ALL' ? ` • ${lang}` : ''}`;
 
-  let text = `🎬 <b>${escapeHTML(query.toUpperCase())}</b> • <code>${count} Files${escapeHTML(activeFilter)}</code>\n`;
-  text += `👤 <b>${escapeHTML(requester)}</b>  |  ⚡ <a href="${GROUP_LINK}"><b>JJ Movies AI</b></a>\n`;
-  text += `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n`;
+  let text = `🎬 <b>${escapeHTML(query)}</b> • <code>${count} Files</code>\n`;
+  text += `👤 ${escapeHTML(requester)} • <a href="${GROUP_LINK}">JJ Movies AI</a>\n`;
+  text += `──────────────\n\n`;
 
   const batchIds = data.slice(0, 5).map(i => i.message_id).join('_');
   const sendAllUrl = `https://t.me/${botUsername}?start=all_${batchIds}`;
 
   data.forEach((item, idx) => {
-    const num = String(page * limit + idx + 1).padStart(2, '0');
+    const num = page * limit + idx + 1;
     const link = `https://t.me/${botUsername}?start=file_${item.message_id}`;
     const meta = detectMeta(item.file_name);
-    text += `🔹 <b>${num}.</b> <a href="${link}">${escapeHTML(item.file_name)}</a>\n`;
-    text += `      💾 <code>${escapeHTML(item.file_size)}</code>  •  🎞️ <code>${escapeHTML(item.quality || meta.quality)}</code>  •  🔊 <code>${escapeHTML(item.language || meta.language)}</code>\n\n`;
+    text += `<b>${num}.</b> <a href="${link}">${escapeHTML(item.file_name)}</a>\n`;
+    text += `📦 <code>${escapeHTML(item.file_size)}</code> | <code>${escapeHTML(item.quality || meta.quality)}</code> | <code>${escapeHTML(item.language || meta.language)}</code>\n\n`;
   });
 
-  text += `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n`;
-  text += `👇 <i>Tap any movie title above to receive in DM</i>`;
+  text += `──────────────\n`;
+  text += `👇 <i>Click a file to get it in DM</i>`;
 
   const qShort = query.slice(0, 18);
   const buttons = [
@@ -401,9 +400,8 @@ Is the user asking for a movie, web series, or anime?
     ctx.react('👀').catch(() => {});
     const { aiSuggestion, similarRows } = await findSpellingOrSimilar(userText);
 
-    let msgText = `🔎 <b>"${escapeHTML(userText)}"</b> not found in library.\n`;
-    msgText += `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n`;
-    msgText += `✍️ <i>Spelling mistake emo oka sari check chey mawa!</i>\n`;
+    let msgText = `🔎 <b>"${escapeHTML(userText)}"</b> mana database lo dorakaledu mawa.\n`;
+    msgText += `✍️ <i>Spelling mistake emo oka sari check chey!</i>\n`;
 
     if (aiSuggestion) {
       msgText += `\n💡 <b>Did you mean:</b> <code>${escapeHTML(aiSuggestion)}</code>?`;
@@ -413,11 +411,11 @@ Is the user asking for a movie, web series, or anime?
       msgText += `\n\n📂 <b>Close matches found:</b>\n`;
       similarRows.forEach((row, i) => {
         const link = `https://t.me/${ctx.botInfo.username}?start=file_${row.message_id}`;
-        msgText += `🔹 <b>0${i + 1}.</b> <a href="${link}">${escapeHTML(row.file_name)}</a>\n      💾 <code>${escapeHTML(row.file_size)}</code>\n`;
+        msgText += `<b>${i + 1}.</b> <a href="${link}">${escapeHTML(row.file_name)}</a>\n📦 <code>${escapeHTML(row.file_size)}</code>\n`;
       });
     }
 
-    msgText += `\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n📩 <i>Leka pothe kindha button click chesi Admin ki request pampu.</i>`;
+    msgText += `\nLekapothe kindha button click chesi Admin ki request pampu!`;
 
     const notFoundMsg = await ctx.reply(msgText, {
       parse_mode: 'HTML',
