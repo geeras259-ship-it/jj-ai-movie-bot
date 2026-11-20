@@ -14,7 +14,8 @@ const aiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
 
 const DB_CHANNEL_ID = (process.env.DB_CHANNEL_ID || '-1004324049481').trim();
 const GROUP_LINK = (process.env.GROUP_LINK || 'https://t.me/+QHmHTKoJButkMzNl').trim();
-const ADMIN_ID = (process.env.ADMIN_ID || '1293174588').trim();
+const ADMIN_ID = String(process.env.ADMIN_ID || '1293174588').trim();
+const TARGET_GROUP_ID = String(process.env.GROUP_ID || '').trim(); // Optional: '-100xxxxxxxxxx'
 
 const SUCCESS_REACTIONS = ['🔥', '🎬', '⚡', '🤩', '🍿'];
 const VIBES = [
@@ -38,9 +39,52 @@ function formatSize(bytes) {
 }
 
 function escapeHTML(str) {
-  return String(str).replace(/[&<>'"]/g, tag => ({
+  return String(str || '').replace(/[&<>'"]/g, tag => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
   }[tag]));
+}
+
+function getRequesterDisplay(ctx) {
+  if (ctx.message?.sender_chat?.title) return ctx.message.sender_chat.title;
+  if (ctx.callbackQuery?.message?.sender_chat?.title) return ctx.callbackQuery.message.sender_chat.title;
+  return 'Member';
+}
+
+// Checks Owner ID, Anonymous Group Admin (sender_chat), or Telegram Group Admin
+async function isAdmin(ctx, userId = ctx.from?.id) {
+  // 1. Owner personal account check
+  if (ADMIN_ID && userId && String(userId) === ADMIN_ID) {
+    return true;
+  }
+
+  // 2. Anonymous Admin posting as Group/Channel (sender_chat)
+  const senderChat = ctx.message?.sender_chat || ctx.callbackQuery?.message?.sender_chat;
+  if (senderChat) {
+    if (TARGET_GROUP_ID) {
+      const cleanSender = String(senderChat.id).replace(/^-100/, '');
+      const cleanTarget = TARGET_GROUP_ID.replace(/^-100/, '');
+      if (cleanSender === cleanTarget) return true;
+    } else if (['group', 'supergroup', 'channel'].includes(senderChat.type)) {
+      return true;
+    }
+  }
+
+  // 3. Normal Telegram group admin check
+  if (!userId || !ctx.chat || ctx.chat.type === 'private') return false;
+  try {
+    const member = await ctx.telegram.getChatMember(ctx.chat.id, userId);
+    return ['creator', 'administrator'].includes(member.status);
+  } catch {
+    return false;
+  }
+}
+
+function containsLink(msg) {
+  const text = msg?.text || msg?.caption || '';
+  const entities = msg?.entities || msg?.caption_entities || [];
+  const hasEntityLink = entities.some(e => ['url', 'text_link', 'mention'].includes(e.type));
+  const hasRegexLink = /(https?:\/\/|www\.|t\.me\/|telegram\.me\/|@[\w]+)/i.test(text);
+  return hasEntityLink || hasRegexLink;
 }
 
 function detectMeta(name) {
@@ -66,16 +110,6 @@ function extractMovieTitle(rawCaption, fallbackFileName) {
   return (fallbackFileName || 'Unknown Movie').replace(/\n/g, ' ').trim();
 }
 
-async function isAdmin(ctx, userId = ctx.from?.id) {
-  if (!userId || ctx.chat?.type === 'private') return false;
-  try {
-    const member = await ctx.telegram.getChatMember(ctx.chat.id, userId);
-    return ['creator', 'administrator'].includes(member.status);
-  } catch {
-    return false;
-  }
-}
-
 function scheduleUserMessageDelete(ctx, delayMs) {
   const msgId = ctx.message?.message_id;
   const chatId = ctx.chat?.id;
@@ -84,9 +118,9 @@ function scheduleUserMessageDelete(ctx, delayMs) {
   setTimeout(async () => {
     try {
       await ctx.telegram.deleteMessage(chatId, msgId);
-      console.log(`🗑️ Deleted user message ${msgId}`);
+      console.log(`🗑️ Deleted message ${msgId}`);
     } catch (e) {
-      console.log(`Could not delete user message ${msgId}:`, e.message);
+      console.log(`Could not delete message ${msgId}:`, e.message);
     }
   }, delayMs);
 }
@@ -132,13 +166,10 @@ async function findSpellingOrSimilar(query) {
   return { aiSuggestion, similarRows };
 }
 
-// 2. /stats COMMAND (Admin Only)
+// 2. /stats COMMAND (Admin / Owner Only)
 bot.command('stats', async (ctx) => {
-  const userId = String(ctx.from?.id || '');
-  const isOwner = ADMIN_ID && userId === String(ADMIN_ID);
-  const chatAdmin = ctx.chat?.type !== 'private' ? await isAdmin(ctx) : false;
-
-  if (!isOwner && !chatAdmin) return;
+  const allowed = await isAdmin(ctx);
+  if (!allowed) return;
 
   const { data, count, error } = await supabase
     .from('movies_index')
@@ -184,35 +215,36 @@ bot.on('new_chat_members', async (ctx) => {
   ctx.deleteMessage().catch(() => {});
   for (const member of ctx.message.new_chat_members) {
     if (member.is_bot) continue;
-    const name = escapeHTML(member.first_name || 'Mawa');
     const welcomeMsg = await ctx.reply(
-      `👋 <b>Welcome ${name}!</b>\n\n🎬 Meeku kavalsina movie name ikkada type cheyandi (e.g., <code>Kalki</code> or <code>Devara</code>), nenu ventane HD files isthanu!\n\n⚠️ <i>External links & promotions are strictly not allowed.</i>`,
+      `👋 <b>Welcome!</b>\n\n🎬 Meeku kavalsina movie name ikkada type cheyandi (e.g., <code>Kalki</code> or <code>Devara</code>), nenu ventane HD files isthanu!\n\n⚠️ <i>External links & promotions are strictly not allowed.</i>`,
       { parse_mode: 'HTML' }
     );
     setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, welcomeMsg.message_id).catch(() => {}), 60 * 1000);
   }
 });
 
-// 5. ANTI-LINK BLOCKER (Non-Admins)
+// 5. LINK GUARD: Allow Admins / Anonymous Group Links, Delete Non-Admin Links
 bot.use(async (ctx, next) => {
   if (!ctx.message || ctx.chat?.type === 'private') return next();
-  const text = ctx.message.text || ctx.message.caption || '';
-  const entities = ctx.message.entities || ctx.message.caption_entities || [];
 
-  const hasLink = entities.some(e => ['url', 'text_link', 'mention'].includes(e.type)) ||
-    /(https?:\/\/|www\.|t\.me\/|telegram\.me\/|@[\w]+)/i.test(text);
-
-  if (hasLink && !(await isAdmin(ctx))) {
-    await ctx.deleteMessage().catch(() => {});
-    const warn = await ctx.reply(`🚫 <b>${escapeHTML(ctx.from?.first_name || 'User')}</b>, external links ee group lo allow levu!`, { parse_mode: 'HTML' });
-    setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, warn.message_id).catch(() => {}), 10 * 1000);
-    return;
+  if (containsLink(ctx.message)) {
+    const allowed = await isAdmin(ctx);
+    if (!allowed) {
+      await ctx.deleteMessage().catch(() => {});
+      const warn = await ctx.reply(
+        `🚫 <b>Links Not Allowed!</b>\nAdmins / Channel links matrame allow. Vere links delete avuthayi.`,
+        { parse_mode: 'HTML' }
+      );
+      setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, warn.message_id).catch(() => {}), 10 * 1000);
+      return;
+    }
   }
+
   return next();
 });
 
 // Helper: Send Single or Multiple Files with Blue Group Link Captions + 5-Min Auto-Delete
-async function deliverFiles(ctx, msgIds, userName) {
+async function deliverFiles(ctx, msgIds, labelName) {
   const sentIds = [];
   let lastTitle = 'Movie';
 
@@ -244,7 +276,7 @@ async function deliverFiles(ctx, msgIds, userName) {
 
   if (sentIds.length === 0) return ctx.reply('❌ File not found or deleted from storage.');
 
-  const shareText = await getUniqueShareMsg(userName, lastTitle);
+  const shareText = await getUniqueShareMsg(labelName, lastTitle);
   const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(GROUP_LINK)}&text=${encodeURIComponent('🎬 Free HD Movies Group mawa! Join avvu:')}`;
 
   const warnMsg = await ctx.reply(
@@ -274,7 +306,7 @@ async function deliverFiles(ctx, msgIds, userName) {
 // 6. DEEP LINK DELIVERY (Single + SEND ALL) & GEMINI /start
 bot.start(async (ctx) => {
   const payload = ctx.startPayload;
-  const userName = ctx.from.first_name || 'Mawa';
+  const labelName = getRequesterDisplay(ctx);
 
   if (!payload) {
     await ctx.sendChatAction('typing').catch(() => {});
@@ -284,27 +316,27 @@ bot.start(async (ctx) => {
         model: 'gemini-2.0-flash',
         generationConfig: { temperature: 1.2, maxOutputTokens: 100 }
       });
-      const prompt = `You are a cool AI Movie Assistant Telegram bot. Write a short, unique welcome message (max 3 lines) in Tenglish using "mawa" style for "${userName}". Vibe: ${vibe}. Tell them to type any movie name in our group for instant HD files. Add movie emojis.`;
+      const prompt = `You are a cool AI Movie Assistant Telegram bot. Write a short, unique welcome message (max 3 lines) in Tenglish using "mawa" style for "${labelName}". Vibe: ${vibe}. Tell them to type any movie name in our group for instant HD files. Add movie emojis.`;
       const res = await creativeModel.generateContent(prompt);
       return ctx.reply(res.response.text().trim(), Markup.inlineKeyboard([[Markup.button.url('🎬 Join Movies Group', GROUP_LINK)]]));
     } catch (e) {
-      return ctx.reply(`🎬 Hey ${userName} mawa! Welcome to AI Movie Bot.\n\nGroup lo movie name type cheyandi, ventane HD files isthanu! 🍿`, Markup.inlineKeyboard([[Markup.button.url('🎬 Join Movies Group', GROUP_LINK)]]));
+      return ctx.reply(`🎬 Hey ${labelName} mawa! Welcome to AI Movie Bot.\n\nGroup lo movie name type cheyandi, ventane HD files isthanu! 🍿`, Markup.inlineKeyboard([[Markup.button.url('🎬 Join Movies Group', GROUP_LINK)]]));
     }
   }
 
   if (payload.startsWith('file_')) {
     const msgId = parseInt(payload.replace('file_', ''), 10);
-    if (!isNaN(msgId)) return deliverFiles(ctx, [msgId], userName);
+    if (!isNaN(msgId)) return deliverFiles(ctx, [msgId], labelName);
   }
 
   if (payload.startsWith('all_')) {
     const ids = payload.replace('all_', '').split('_').map(Number).filter(n => !isNaN(n));
-    if (ids.length > 0) return deliverFiles(ctx, ids, userName);
+    if (ids.length > 0) return deliverFiles(ctx, ids, labelName);
   }
 });
 
-// Helper: Build Clean & Minimal Movie Results Message
-async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', botUsername, requester) {
+// Helper: Build Clean & Minimal Movie Results Message (No User IDs/Names)
+async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', botUsername, tagLabel = 'JJ Movies AI') {
   const limit = 6;
   let dbQuery = supabase
     .from('movies_index')
@@ -323,7 +355,7 @@ async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', b
   const totalPages = Math.ceil(count / limit);
 
   let text = `🎬 <b>${escapeHTML(query)}</b> • <code>${count} Files</code>\n`;
-  text += `👤 ${escapeHTML(requester)} • <a href="${GROUP_LINK}">JJ Movies AI</a>\n`;
+  text += `⚡ <a href="${GROUP_LINK}">${escapeHTML(tagLabel)}</a>\n`;
   text += `──────────────\n\n`;
 
   const batchIds = data.slice(0, 5).map(i => i.message_id).join('_');
@@ -366,11 +398,24 @@ async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', b
   return { text, keyboard: Markup.inlineKeyboard(buttons) };
 }
 
-// 7. SMART AI GROUP SEARCH + AUTO-DELETE USER & BOT MESSAGES
+// 7. SMART AI GROUP SEARCH + DELETE NON-MOVIE / UNWANTED MESSAGES
 bot.on('text', async (ctx) => {
   if (ctx.chat.type === 'private') return;
   const userText = ctx.message.text.trim();
-  if (userText.startsWith('/') || userText.length < 2) return;
+  if (userText.startsWith('/')) return;
+
+  const adminUser = await isAdmin(ctx);
+
+  // If Admin / Anonymous Group posts a link or announcement, keep it as-is
+  if (adminUser && containsLink(ctx.message)) {
+    return;
+  }
+
+  // Delete very short messages (except admins)
+  if (userText.length < 2) {
+    if (!adminUser) scheduleUserMessageDelete(ctx, 10 * 1000);
+    return;
+  }
 
   let searchKeyword = userText;
   try {
@@ -382,7 +427,7 @@ Is the user asking for a movie, web series, or anime?
     const aiOut = result.response.text().trim().replace(/['"]/g, '');
 
     if (aiOut.toUpperCase() === 'NONE') {
-      scheduleUserMessageDelete(ctx, 20 * 1000);
+      if (!adminUser) scheduleUserMessageDelete(ctx, 15 * 1000);
       return;
     }
     if (aiOut && aiOut.length < 50) searchKeyword = aiOut;
@@ -390,10 +435,10 @@ Is the user asking for a movie, web series, or anime?
     console.log('Gemini intent fallback:', e.message);
   }
 
-  let res = await buildSearchMessage(searchKeyword, 0, 'ALL', 'ALL', ctx.botInfo.username, ctx.from.first_name || 'User');
+  let res = await buildSearchMessage(searchKeyword, 0, 'ALL', 'ALL', ctx.botInfo.username, 'JJ Movies AI');
 
   if (!res && searchKeyword.toLowerCase() !== userText.toLowerCase()) {
-    res = await buildSearchMessage(userText, 0, 'ALL', 'ALL', ctx.botInfo.username, ctx.from.first_name || 'User');
+    res = await buildSearchMessage(userText, 0, 'ALL', 'ALL', ctx.botInfo.username, 'JJ Movies AI');
   }
 
   if (!res) {
@@ -425,7 +470,7 @@ Is the user asking for a movie, web series, or anime?
     });
 
     setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, notFoundMsg.message_id).catch(() => {}), 20 * 1000);
-    scheduleUserMessageDelete(ctx, 20 * 1000);
+    if (!adminUser) scheduleUserMessageDelete(ctx, 20 * 1000);
     return;
   }
 
@@ -440,13 +485,13 @@ Is the user asking for a movie, web series, or anime?
   });
 
   setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, resultMsg.message_id).catch(() => {}), 60 * 1000);
-  scheduleUserMessageDelete(ctx, 60 * 1000);
+  if (!adminUser) scheduleUserMessageDelete(ctx, 60 * 1000);
 });
 
-// 8. CALLBACK HANDLERS (Filters, Pagination & Real Admin Request)
+// 8. CALLBACK HANDLERS (Filters, Pagination & Admin Request)
 bot.action(/^f\|(.+)\|(\d+)\|(.+)\|(.+)$/, async (ctx) => {
   const [, query, pageStr, qual, lang] = ctx.match;
-  const res = await buildSearchMessage(query, parseInt(pageStr, 10), qual, lang, ctx.botInfo.username, ctx.from.first_name);
+  const res = await buildSearchMessage(query, parseInt(pageStr, 10), qual, lang, ctx.botInfo.username, 'JJ Movies AI');
   if (!res) return ctx.answerCbQuery('❌ Ee filter lo files levu!', { show_alert: true });
 
   await ctx.editMessageText(res.text, {
@@ -459,12 +504,11 @@ bot.action(/^f\|(.+)\|(\d+)\|(.+)\|(.+)$/, async (ctx) => {
 
 bot.action(/^req\|(.+)$/, async (ctx) => {
   const movieName = ctx.match[1];
-  const requester = ctx.from.first_name || 'User';
 
   if (ADMIN_ID) {
     await ctx.telegram.sendMessage(
       ADMIN_ID,
-      `📩 <b>NEW MOVIE REQUEST!</b>\n\n🎬 <b>Movie:</b> <code>${escapeHTML(movieName)}</code>\n👤 <b>User:</b> ${escapeHTML(requester)} (<code>${ctx.from.id}</code>)`,
+      `📩 <b>NEW MOVIE REQUEST!</b>\n\n🎬 <b>Movie:</b> <code>${escapeHTML(movieName)}</code>`,
       { parse_mode: 'HTML' }
     ).catch(() => {});
   }
