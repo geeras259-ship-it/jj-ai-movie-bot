@@ -66,13 +66,30 @@ function extractMovieTitle(rawCaption, fallbackFileName) {
   return (fallbackFileName || 'Unknown Movie').replace(/\n/g, ' ').trim();
 }
 
-async function isAdmin(ctx) {
+async function isAdmin(ctx, userId = ctx.from?.id) {
+  if (!userId || ctx.chat?.type === 'private') return false;
   try {
-    const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+    const member = await ctx.telegram.getChatMember(ctx.chat.id, userId);
     return ['creator', 'administrator'].includes(member.status);
   } catch {
     return false;
   }
+}
+
+// Auto-delete user message safely (skips owner/admins)
+function scheduleUserMessageDelete(ctx, delayMs) {
+  const userId = ctx.from?.id;
+  const msgId = ctx.message?.message_id;
+  const chatId = ctx.chat?.id;
+  if (!userId || !msgId || !chatId) return;
+  if (ADMIN_ID && String(userId) === String(ADMIN_ID)) return;
+
+  setTimeout(async () => {
+    const admin = await isAdmin(ctx, userId);
+    if (!admin) {
+      await ctx.telegram.deleteMessage(chatId, msgId).catch(() => {});
+    }
+  }, delayMs);
 }
 
 async function getUniqueShareMsg(userName, movieName) {
@@ -103,7 +120,6 @@ async function findSpellingOrSimilar(query) {
     }
   } catch (e) {}
 
-  // Check partial prefix in DB (first 4 chars if length >= 4)
   let similarRows = [];
   if (query.length >= 4) {
     const prefix = query.slice(0, 4);
@@ -346,7 +362,7 @@ async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', b
   return { text, keyboard: Markup.inlineKeyboard(buttons) };
 }
 
-// 7. SMART AI GROUP SEARCH (Ignores normal chat + Spelling/Similar hints when not found)
+// 7. SMART AI GROUP SEARCH + AUTO-DELETE USER & BOT MESSAGES
 bot.on('text', async (ctx) => {
   if (ctx.chat.type === 'private') return;
   const userText = ctx.message.text.trim();
@@ -361,7 +377,10 @@ Is the user asking for a movie, web series, or anime?
     const result = await aiModel.generateContent(prompt);
     const aiOut = result.response.text().trim().replace(/['"]/g, '');
 
-    if (aiOut.toUpperCase() === 'NONE') return;
+    if (aiOut.toUpperCase() === 'NONE') {
+      scheduleUserMessageDelete(ctx, 30 * 1000);
+      return;
+    }
     if (aiOut && aiOut.length < 50) searchKeyword = aiOut;
   } catch (e) {
     console.log('Gemini intent fallback:', e.message);
@@ -369,7 +388,6 @@ Is the user asking for a movie, web series, or anime?
 
   let res = await buildSearchMessage(searchKeyword, 0, 'ALL', 'ALL', ctx.botInfo.username, ctx.from.first_name || 'User');
 
-  // If AI-corrected keyword didn't match, try raw user text once
   if (!res && searchKeyword.toLowerCase() !== userText.toLowerCase()) {
     res = await buildSearchMessage(userText, 0, 'ALL', 'ALL', ctx.botInfo.username, ctx.from.first_name || 'User');
   }
@@ -393,7 +411,7 @@ Is the user asking for a movie, web series, or anime?
       });
     }
 
-    msgText += `\nLeKAPOTHE kindha button click chesi Admin ki request pampu!`;
+    msgText += `\nLekapothe kindha button click chesi Admin ki request pampu!`;
 
     const notFoundMsg = await ctx.reply(msgText, {
       parse_mode: 'HTML',
@@ -401,7 +419,9 @@ Is the user asking for a movie, web series, or anime?
       reply_to_message_id: ctx.message.message_id,
       ...Markup.inlineKeyboard([[Markup.button.callback('📩 Request Admin', `req|${userText.slice(0, 35)}`)]])
     });
+
     setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, notFoundMsg.message_id).catch(() => {}), 25 * 1000);
+    scheduleUserMessageDelete(ctx, 25 * 1000);
     return;
   }
 
@@ -416,6 +436,7 @@ Is the user asking for a movie, web series, or anime?
   });
 
   setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, resultMsg.message_id).catch(() => {}), 2 * 60 * 1000);
+  scheduleUserMessageDelete(ctx, 2 * 60 * 1000);
 });
 
 // 8. CALLBACK HANDLERS (Filters, Pagination & Real Admin Request)
