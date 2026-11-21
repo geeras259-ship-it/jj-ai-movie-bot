@@ -227,6 +227,12 @@ function escapeHTML(str) {
   }[tag]));
 }
 
+function isValidMovieTitle(name = '') {
+  const cleaned = String(name).trim();
+  if (!cleaned) return false;
+  return /[a-zA-Z0-9\u0C00-\u0C7F]/.test(cleaned);
+}
+
 function getRequesterDisplay(ctx) {
   if (ctx.message?.sender_chat?.title) return ctx.message.sender_chat.title;
   if (ctx.callbackQuery?.message?.sender_chat?.title) return ctx.callbackQuery.message.sender_chat.title;
@@ -616,15 +622,16 @@ async function postDailySpotlight() {
     if (!count || count === 0) return;
 
     let movie = null;
-    for (let tries = 0; tries < 5; tries++) {
+    for (let tries = 0; tries < 10; tries++) {
       const randomOffset = Math.floor(Math.random() * count);
       const { data } = await supabase
         .from('movies_index')
         .select('*')
         .range(randomOffset, randomOffset);
 
-      if (data && data[0] && !recentSpotlights.has(data[0].message_id)) {
-        movie = data[0];
+      const candidate = data?.[0];
+      if (candidate && isValidMovieTitle(candidate.file_name) && !recentSpotlights.has(candidate.message_id)) {
+        movie = candidate;
         break;
       }
     }
@@ -637,10 +644,11 @@ async function postDailySpotlight() {
 
     const botUsername = bot.botInfo?.username || (await bot.telegram.getMe()).username;
     const movieLink = `https://t.me/${botUsername}?start=file_${movie.message_id}`;
+    const displayTitle = String(movie.file_name).trim();
 
     const text =
       `🎬 <b>Featured Movie of the Day</b>\n\n` +
-      `<b>${escapeHTML(movie.file_name)}</b>\n` +
+      `<b>${escapeHTML(displayTitle)}</b>\n` +
       `📦 <b>Size:</b> ${escapeHTML(movie.file_size || 'HD')}  •  <b>Quality:</b> ${escapeHTML(movie.quality || 'HD')}\n\n` +
       `Available now in our official channel! You can also type any movie name right here in the group to get instant files.\n\n` +
       `<i>⏳ This spotlight auto-updates with a new movie every few hours.</i>`;
@@ -1409,7 +1417,7 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-// ================= FILE DELIVERY (SINGLE, SEND ALL & BATCH) + DYNAMIC AUTO-DELETE =================
+// ================= FILE DELIVERY (SINGLE, SEND ALL & BATCH) + SHARE & SUPPORT US + DYNAMIC AUTO-DELETE =================
 async function deliverFiles(ctx, items, labelName) {
   const sentIds = [];
   let lastTitle = 'Movie';
@@ -1449,18 +1457,18 @@ async function deliverFiles(ctx, items, labelName) {
   if (sentIds.length === 0) return ctx.reply('❌ File not found or deleted from storage.');
 
   const shareText = await getUniqueShareMsg(labelName, lastTitle);
-  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(activeGroupLink)}&text=${encodeURIComponent('🎬 Free HD Movies Group mawa! Join avvu:')}`;
+  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(activeGroupLink)}&text=${encodeURIComponent('🎬 Watch & Download Latest Movies in HD! Join here:')}`;
 
   const noteLine = fileDeleteMinutes > 0
-    ? `\n\n⚠️ <b>Note:</b> Ee file(s) <b>${fileDeleteMinutes} minute(s)</b> lo auto-delete avuthayi. Ventane Saved Messages ki forward chesko!`
+    ? `\n\n⚠️ <b>Important:</b>\n<i>All messages will be deleted after <b>${fileDeleteMinutes} minute(s)</b>. Please save or forward these messages to your personal Saved Messages to avoid losing them!</i>`
     : '';
 
   const warnMsg = await ctx.reply(
-    `${shareText}${noteLine}`,
+    `<b>Share & Support Us</b> ❤️🤍\n${shareText}${noteLine}`,
     {
       parse_mode: 'HTML',
       reply_to_message_id: sentIds[sentIds.length - 1],
-      ...Markup.inlineKeyboard([[Markup.button.url('📤 Share Group with Friends', shareUrl)]])
+      ...Markup.inlineKeyboard([[Markup.button.url('📤 Share & Support Us', shareUrl)]])
     }
   );
 
@@ -1471,10 +1479,10 @@ async function deliverFiles(ctx, items, labelName) {
       }
       await ctx.telegram.editMessageText(
         ctx.chat.id, warnMsg.message_id, null,
-        '✅ <b>YOUR FILES HAVE BEEN DELETED!</b>\nKindly search again in the group.',
+        '<b>Share & Support Us</b> ❤️🤍\n\n✅ <b>YOUR FILES HAVE BEEN DELETED!</b>\nKindly search again in the group.',
         {
           parse_mode: 'HTML',
-          ...Markup.inlineKeyboard([[Markup.button.url('📤 Share Group with Friends', shareUrl)]])
+          ...Markup.inlineKeyboard([[Markup.button.url('📤 Share & Support Us', shareUrl)]])
         }
       ).catch(() => {});
 
