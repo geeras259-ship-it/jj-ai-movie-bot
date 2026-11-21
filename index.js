@@ -44,6 +44,10 @@ let channels = {
 };
 const adminState = new Map();
 
+// Supabase Limit / Storage Early Warning Config
+const DB_WARN_THRESHOLD = 40000;
+let lastDbQuotaAlertAt = 0;
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Category Menu Helper
@@ -83,6 +87,32 @@ async function loadDynamicConfig() {
 }
 loadDynamicConfig();
 
+// Early Warning Alert for Supabase Limit / Storage
+async function notifyOwnerDbAlert(reasonText) {
+  const now = Date.now();
+  if (now - lastDbQuotaAlertAt < 24 * 60 * 60 * 1000) return;
+  lastDbQuotaAlertAt = now;
+
+  const recipients = [ADMIN_ID, ...extraAdmins].filter(Boolean);
+  const msg =
+    `🚨 <b>SUPABASE LIMIT / STORAGE ALERT</b>\n\n` +
+    `${reasonText}\n\n` +
+    `👉 <i>Supabase lo limit/storage full avvakunda munde kotha Supabase ID (project) create cheskondi, tarvata <code>/adddb</code> tho bot lo add cheyandi!</i>`;
+
+  for (const uid of recipients) {
+    await bot.telegram.sendMessage(uid, msg, { parse_mode: 'HTML' }).catch(() => {});
+  }
+}
+
+async function checkSupabaseThreshold(client = supabase) {
+  try {
+    const { count } = await client.from('movies_index').select('*', { count: 'exact', head: true });
+    if (typeof count === 'number' && count >= DB_WARN_THRESHOLD) {
+      await notifyOwnerDbAlert(`📊 <b>Current Indexed Rows:</b> <code>${count}</code> / <code>${DB_WARN_THRESHOLD}</code>`);
+    }
+  } catch (e) {}
+}
+
 // Helpers
 function formatSize(bytes) {
   if (!bytes) return 'Unknown';
@@ -102,18 +132,15 @@ function getRequesterDisplay(ctx) {
   return 'Member';
 }
 
-// Main Owner Only (Add/Remove Admins)
 function isMainOwnerDM(ctx) {
   return ctx.chat?.type === 'private' && String(ctx.from?.id || '') === ADMIN_ID;
 }
 
-// Main Owner + Added Admins (DM Admin Panel & Commands)
 function isOwnerDM(ctx) {
   const uid = String(ctx.from?.id || '');
   return ctx.chat?.type === 'private' && (uid === ADMIN_ID || extraAdmins.includes(uid));
 }
 
-// Checks Owner, Added Admins, Anonymous Group Admin, or Telegram Group Admin
 async function isAdmin(ctx, userId = ctx.from?.id) {
   const uid = String(userId || '');
   if (uid && (uid === ADMIN_ID || extraAdmins.includes(uid))) return true;
@@ -170,7 +197,10 @@ function extractMovieTitle(rawCaption, fallbackFileName) {
 }
 
 function parseFileMeta(rawName) {
-  const cleanStr = (rawName || '').replace(/\.(mkv|mp4|avi|mov)$/i, '').replace(/[\._]/g, ' ');
+  const cleanStr = (rawName || '')
+    .replace(/\.(mkv|mp4|avi|mov|webm)$/i, '')
+    .replace(/[\._]/g, ' ');
+
   const isSeries = /\b(S\d{1,2}|Season\s*\d{1,2}|E\d{1,2}|EP\s*\d{1,2})\b/i.test(cleanStr);
   const seasonMatch = cleanStr.match(/\b(?:S|Season\s*)0?(\d{1,2})\b/i);
   const seasonNum = seasonMatch ? parseInt(seasonMatch[1], 10) : null;
@@ -179,24 +209,26 @@ function parseFileMeta(rawName) {
   const year = yearMatch ? yearMatch[1] : null;
 
   const langs = [];
-  if (/telugu|tel\b/i.test(cleanStr)) langs.push('Telugu');
-  if (/tamil|tam\b/i.test(cleanStr)) langs.push('Tamil');
-  if (/hindi|hin\b/i.test(cleanStr)) langs.push('Hindi');
-  if (/english|eng\b/i.test(cleanStr)) langs.push('English');
-  if (/malayalam|mal\b/i.test(cleanStr)) langs.push('Malayalam');
-  if (/kannada|kan\b/i.test(cleanStr)) langs.push('Kannada');
+  if (/\b(telugu|tel)\b/i.test(cleanStr)) langs.push('Telugu');
+  if (/\b(tamil|tam)\b/i.test(cleanStr)) langs.push('Tamil');
+  if (/\b(hindi|hin)\b/i.test(cleanStr)) langs.push('Hindi');
+  if (/\b(english|eng)\b/i.test(cleanStr)) langs.push('English');
+  if (/\b(malayalam|mal)\b/i.test(cleanStr)) langs.push('Malayalam');
+  if (/\b(kannada|kan)\b/i.test(cleanStr)) langs.push('Kannada');
 
   const qualMatch = cleanStr.match(/\b(480p|720p|1080p|2160p|4K)\b/i);
   const quality = qualMatch ? qualMatch[1].toUpperCase() : 'HD';
 
   let title = cleanStr
     .replace(/\b(19\d{2}|20\d{2})\b.*/i, '')
-    .replace(/\b(S\d{1,2}.*|Season\s*\d+.*|480p.*|720p.*|1080p.*|WEB-DL.*|HDRip.*|BluRay.*|HQ.*|PreDVD.*)/i, '')
-    .replace(/[\(\)\[\]\-–—]+/g, ' ')
+    .replace(/\b(S\d{1,2}|Season\s*\d+|E\d{1,2}|EP\s*\d+|480p|720p|1080p|2160p|4K|WEB-DL|WEBRip|HDRip|BluRay|HQ|PreDVD|CAM|Rip|Dual\s*Audio|Telugu|Tamil|Hindi|English|Malayalam|Kannada|Dubbed|Uncut|ESub|x264|x265|HEVC|10bit|AAC|5\.1|2\.0)\b.*/i, '')
+    .replace(/[\(\)\[\]\{\}\-–—_]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 
-  if (!title || title.length < 2) title = cleanStr.slice(0, 35).trim();
+  if (!title || title.length < 2) {
+    title = cleanStr.replace(/[\(\)\[\]\-–—]+/g, ' ').replace(/\s+/g, ' ').slice(0, 35).trim();
+  }
 
   const groupKey = `${title.toLowerCase().replace(/[^a-z0-9]/g, '')}_${year || 'na'}${isSeries && seasonNum ? `_s${seasonNum}` : ''}`;
   return { title, year, langs, quality, isSeries, seasonNum, groupKey };
@@ -207,10 +239,19 @@ async function fetchTmdbInfo(title, year, isSeries) {
   try {
     const type = isSeries ? 'tv' : 'movie';
     const yearParam = year ? (isSeries ? `&first_air_date_year=${year}` : `&year=${year}`) : '';
-    const searchUrl = `https://api.themoviedb.org/3/search/${type}?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(title)}${yearParam}`;
-    const res = await fetch(searchUrl);
-    const data = await res.json();
-    const first = data.results?.[0];
+    let searchUrl = `https://api.themoviedb.org/3/search/${type}?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(title)}${yearParam}`;
+    let res = await fetch(searchUrl);
+    let data = await res.json();
+    let first = data.results?.[0];
+
+    // Fallback without year if not found
+    if (!first && year) {
+      searchUrl = `https://api.themoviedb.org/3/search/${type}?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(title)}`;
+      res = await fetch(searchUrl);
+      data = await res.json();
+      first = data.results?.[0];
+    }
+
     if (!first) return null;
 
     const detailUrl = `https://api.themoviedb.org/3/${type}/${first.id}?api_key=${TMDB_API_KEY}`;
@@ -223,11 +264,13 @@ async function fetchTmdbInfo(title, year, isSeries) {
 
     const isMarvelOrDc = /(marvel|dc films|dc entertainment|dc studios|avengers|spider-man|batman|superman|deadpool|wolverine|thunderbolts|loki|daredevil|peacemaker|joker|aquaman|flash|iron man|thor|captain america|x-men)/i.test(combinedText);
 
+    const posterPath = det.poster_path || first.poster_path;
+
     return {
-      title: det.title || det.name || title,
+      title: det.title || det.name || first.title || first.name || title,
       year: (det.release_date || det.first_air_date || year || '').slice(0, 4),
-      originalLang: det.original_language || '',
-      posterUrl: det.poster_path ? `https://image.tmdb.org/t/p/w500${det.poster_path}` : null,
+      originalLang: det.original_language || first.original_language || '',
+      posterUrl: posterPath ? `https://image.tmdb.org/t/p/w500${posterPath}` : null,
       isMarvelOrDc
     };
   } catch (err) {
@@ -337,7 +380,8 @@ bot.command('addadmin', async (ctx) => {
   if (!/^\d+$/.test(uid)) {
     return ctx.reply('❌ Usage: <code>/addadmin 1234567890</code>', { parse_mode: 'HTML' });
   }
-  await supabase.from('bot_admins').upsert({ user_id: uid }, { onConflict: 'user_id' });
+  const { error } = await supabase.from('bot_admins').upsert({ user_id: uid }, { onConflict: 'user_id' });
+  if (error) return ctx.reply(`❌ DB Error: <code>${escapeHTML(error.message)}</code>`, { parse_mode: 'HTML' });
   await loadDynamicConfig();
   ctx.reply(`✅ Admin <code>${uid}</code> added!`, { parse_mode: 'HTML' });
 });
@@ -348,7 +392,8 @@ bot.command('deladmin', async (ctx) => {
   if (!/^\d+$/.test(uid)) {
     return ctx.reply('❌ Usage: <code>/deladmin 1234567890</code>', { parse_mode: 'HTML' });
   }
-  await supabase.from('bot_admins').delete().eq('user_id', uid);
+  const { error } = await supabase.from('bot_admins').delete().eq('user_id', uid);
+  if (error) return ctx.reply(`❌ DB Error: <code>${escapeHTML(error.message)}</code>`, { parse_mode: 'HTML' });
   await loadDynamicConfig();
   ctx.reply(`🗑️ Admin <code>${uid}</code> removed.`, { parse_mode: 'HTML' });
 });
@@ -386,7 +431,8 @@ bot.command('delchannel', async (ctx) => {
   const chId = ctx.message.text.replace('/delchannel', '').trim();
   if (!/^-?\d+$/.test(chId)) return ctx.reply('❌ Usage: <code>/delchannel -1001234567890</code>', { parse_mode: 'HTML' });
 
-  await supabase.from('bot_channels').delete().eq('channel_id', chId);
+  const { error } = await supabase.from('bot_channels').delete().eq('channel_id', chId);
+  if (error) return ctx.reply(`❌ DB Error: <code>${escapeHTML(error.message)}</code>`, { parse_mode: 'HTML' });
   await loadDynamicConfig();
   ctx.reply(`🗑️ Channel <code>${chId}</code> removed.`, { parse_mode: 'HTML' });
 });
@@ -403,10 +449,10 @@ bot.command('listdb', (ctx) => {
   ctx.reply(`🗄️ <b>Active Databases:</b>\n\n<b>Main:</b> ${process.env.SUPABASE_URL || 'Default'}\n\n<b>Extra:</b>\n${escapeHTML(list)}`, { parse_mode: 'HTML' });
 });
 
-// ================= TMDB 4-CHANNEL AUTO-POSTER =================
+// ================= FAST TMDB 4-CHANNEL AUTO-POSTER (POSTER + TITLE + BATCH LINK) =================
 bot.command('autopost', async (ctx) => {
   if (!isOwnerDM(ctx)) return;
-  await ctx.reply('🔄 Scanning all Supabase DBs & grouping movies/series...');
+  await ctx.reply('🔄 Scanning Supabase DBs & posting movies/series with Posters & Batch Links...');
 
   let allFiles = [];
   const dbsToRead = [supabase, ...extraDbs.map((d) => d.client)];
@@ -441,71 +487,87 @@ bot.command('autopost', async (ctx) => {
   const { data: existing } = await supabase.from('movie_batches').select('movie_key').eq('posted', true);
   const postedKeys = new Set((existing || []).map((e) => e.movie_key));
 
+  const pendingEntries = Array.from(groups.entries()).filter(([key]) => !postedKeys.has(key));
   let postedCount = 0;
 
-  for (const [movieKey, g] of groups.entries()) {
-    if (postedKeys.has(movieKey)) continue;
+  const CHUNK_SIZE = 5;
+  for (let i = 0; i < pendingEntries.length; i += CHUNK_SIZE) {
+    const chunk = pendingEntries.slice(i, i + CHUNK_SIZE);
 
-    const tmdb = await fetchTmdbInfo(g.meta.title, g.meta.year, g.meta.isSeries);
-    const finalTitle = tmdb?.title || g.meta.title;
-    const finalYear = tmdb?.year || g.meta.year || 'N/A';
-    const langsArr = Array.from(g.langs);
-    const langsText = langsArr.length > 0 ? langsArr.join(', ') : 'Telugu';
-    const qualsText = Array.from(g.qualities).join(', ');
+    await Promise.all(chunk.map(async ([movieKey, g]) => {
+      const tmdb = await fetchTmdbInfo(g.meta.title, g.meta.year, g.meta.isSeries);
+      const finalTitle = tmdb?.title || g.meta.title;
+      const finalYear = tmdb?.year || g.meta.year || 'N/A';
+      const langsArr = Array.from(g.langs);
+      const langsText = langsArr.length > 0 ? langsArr.join(', ') : 'Telugu';
+      const qualsText = Array.from(g.qualities).join(', ');
 
-    // Priority: 1. Marvel/DC -> 2. Web Series -> 3. Hollywood Telugu Dubbed -> 4. Telugu/Remaining
-    let targetType = 'telugu';
-    if (tmdb?.isMarvelOrDc) {
-      targetType = 'marvel';
-    } else if (g.meta.isSeries) {
-      targetType = 'series';
-    } else if (tmdb?.originalLang === 'en' && langsArr.includes('Telugu')) {
-      targetType = 'dubbed';
-    }
-
-    const targetChannels = channels[targetType]?.length > 0 ? channels[targetType] : channels.telugu;
-    if (!targetChannels || targetChannels.length === 0) continue;
-
-    const batchCode = `b_${Date.now().toString(36)}${Math.floor(Math.random() * 90 + 10)}`;
-    const deepLink = `https://t.me/${ctx.botInfo.username}?start=${batchCode}`;
-
-    const { error: saveErr } = await supabase.from('movie_batches').upsert({
-      batch_code: batchCode,
-      movie_key: movieKey,
-      movie_title: finalTitle,
-      file_items: g.items,
-      posted: true
-    }, { onConflict: 'movie_key' });
-
-    if (saveErr) {
-      console.error('Batch Save Error:', saveErr.message);
-      continue;
-    }
-
-    const seasonTag = g.meta.isSeries && g.meta.seasonNum ? ` - Season ${g.meta.seasonNum}` : '';
-    const caption =
-      `🎬 <b>${escapeHTML(finalTitle)}${seasonTag} (${escapeHTML(finalYear)})</b>\n\n` +
-      `📅 <b>Year:</b> ${escapeHTML(finalYear)}\n` +
-      `🔊 <b>Languages:</b> ${escapeHTML(langsText)}\n` +
-      `🎞️ <b>Qualities:</b> ${escapeHTML(qualsText)}\n` +
-      `📂 <b>Total Files:</b> ${g.items.length}`;
-
-    const keyboard = Markup.inlineKeyboard([[Markup.button.url('⚡ Download All Files', deepLink)]]);
-
-    for (const targetCh of targetChannels) {
-      try {
-        if (tmdb?.posterUrl) {
-          await ctx.telegram.sendPhoto(targetCh, tmdb.posterUrl, { caption, parse_mode: 'HTML', ...keyboard });
-        } else {
-          await ctx.telegram.sendMessage(targetCh, caption, { parse_mode: 'HTML', ...keyboard });
-        }
-      } catch (err) {
-        console.error(`Post failed for ${finalTitle} in ${targetCh}:`, err.message);
+      // Priority: 1. Marvel/DC -> 2. Web Series -> 3. Hollywood Telugu Dubbed -> 4. Telugu/Remaining
+      let targetType = 'telugu';
+      if (tmdb?.isMarvelOrDc) {
+        targetType = 'marvel';
+      } else if (g.meta.isSeries) {
+        targetType = 'series';
+      } else if (tmdb?.originalLang === 'en' && langsArr.includes('Telugu')) {
+        targetType = 'dubbed';
       }
-      await sleep(5000); // Safe 5s delay
-    }
 
-    postedCount++;
+      const targetChannels = channels[targetType]?.length > 0 ? channels[targetType] : channels.telugu;
+      if (!targetChannels || targetChannels.length === 0) return;
+
+      const batchCode = `b_${Date.now().toString(36)}${Math.floor(Math.random() * 900 + 100)}`;
+      const deepLink = `https://t.me/${ctx.botInfo.username}?start=${batchCode}`;
+
+      const { error: saveErr } = await supabase.from('movie_batches').upsert({
+        batch_code: batchCode,
+        movie_key: movieKey,
+        movie_title: finalTitle,
+        file_items: g.items,
+        posted: true
+      }, { onConflict: 'movie_key' });
+
+      if (saveErr) {
+        console.error('Batch Save Error:', saveErr.message);
+        return;
+      }
+
+      const seasonTag = g.meta.isSeries && g.meta.seasonNum ? ` • Season ${g.meta.seasonNum}` : '';
+      const caption =
+        `🎬 <b>${escapeHTML(finalTitle)}${seasonTag} (${escapeHTML(finalYear)})</b>\n\n` +
+        `🔊 <b>Audio:</b> ${escapeHTML(langsText)}\n` +
+        `🎞️ <b>Quality:</b> ${escapeHTML(qualsText)}\n` +
+        `📦 <b>Batch Files:</b> ${g.items.length} File(s)\n\n` +
+        `🔗 <b>Batch Link:</b> <a href="${deepLink}">Click Here to Get All Files</a>`;
+
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.url('⚡ Get Batch Files', deepLink)]
+      ]);
+
+      for (const targetCh of targetChannels) {
+        try {
+          if (tmdb?.posterUrl) {
+            await ctx.telegram.sendPhoto(targetCh, tmdb.posterUrl, {
+              caption,
+              parse_mode: 'HTML',
+              ...keyboard
+            });
+          } else {
+            await ctx.telegram.sendMessage(targetCh, caption, {
+              parse_mode: 'HTML',
+              disable_web_page_preview: false,
+              ...keyboard
+            });
+          }
+          postedCount++;
+        } catch (err) {
+          console.error(`Post failed for ${finalTitle} in ${targetCh}:`, err.message);
+        }
+      }
+    }));
+
+    if (i + CHUNK_SIZE < pendingEntries.length) {
+      await sleep(1500);
+    }
   }
 
   ctx.reply(`✅ Auto-Post Complete! Total new posts: <b>${postedCount}</b>`, { parse_mode: 'HTML' });
@@ -536,13 +598,20 @@ bot.on('channel_post', async (ctx) => {
   };
 
   const { error } = await supabase.from('movies_index').upsert(record, { onConflict: 'message_id' });
-  if (error && extraDbs.length > 0) {
-    for (const db of extraDbs) {
-      const res = await db.client.from('movies_index').upsert(record, { onConflict: 'message_id' });
-      if (!res.error) break;
+  if (error) {
+    const errMsg = String(error.message || '').toLowerCase();
+    if (/quota|storage|limit|space|full|exceeded/i.test(errMsg)) {
+      await notifyOwnerDbAlert(`❌ <b>DB Error:</b> <code>${escapeHTML(error.message)}</code>`);
     }
-  } else if (!error) {
+    if (extraDbs.length > 0) {
+      for (const db of extraDbs) {
+        const res = await db.client.from('movies_index').upsert(record, { onConflict: 'message_id' });
+        if (!res.error) break;
+      }
+    }
+  } else {
     console.log(`✅ Indexed: ${cleanName} (${fileSize})`);
+    await checkSupabaseThreshold(supabase);
   }
 });
 
@@ -606,7 +675,7 @@ async function deliverFiles(ctx, items, labelName) {
         parse_mode: 'HTML'
       });
       sentIds.push(sent.message_id);
-      await sleep(800);
+      await sleep(500);
     } catch (e) {
       console.log(`Failed to send msgId ${msgId}:`, e.message);
     }
@@ -717,7 +786,14 @@ bot.on('message', async (ctx, next) => {
       return ctx.reply('❌ Invalid Channel ID. Forward a message from the channel or send <code>-100...</code> ID.', { parse_mode: 'HTML' });
     }
 
-    await supabase.from('bot_channels').upsert({ channel_id: chId, channel_type: state.category }, { onConflict: 'channel_id' });
+    const { error } = await supabase
+      .from('bot_channels')
+      .upsert({ channel_id: chId, channel_type: state.category }, { onConflict: 'channel_id' });
+
+    if (error) {
+      return ctx.reply(`❌ Failed to save channel: <code>${escapeHTML(error.message)}</code>`, { parse_mode: 'HTML' });
+    }
+
     await loadDynamicConfig();
     adminState.delete(ctx.chat.id);
     return ctx.reply(`✅ Saved! Channel <code>${chId}</code> added to <b>${state.category.toUpperCase()}</b>.`, { parse_mode: 'HTML' });
@@ -729,7 +805,10 @@ bot.on('message', async (ctx, next) => {
       return ctx.reply('❌ Format: <code>SUPABASE_URL SUPABASE_ANON_KEY</code>', { parse_mode: 'HTML' });
     }
     const [url, anon_key] = parts;
-    await supabase.from('bot_databases').upsert({ url, anon_key }, { onConflict: 'url' });
+    const { error } = await supabase.from('bot_databases').upsert({ url, anon_key }, { onConflict: 'url' });
+    if (error) {
+      return ctx.reply(`❌ Failed to save DB: <code>${escapeHTML(error.message)}</code>`, { parse_mode: 'HTML' });
+    }
     await loadDynamicConfig();
     adminState.delete(ctx.chat.id);
     return ctx.reply('✅ Extra Supabase DB added and active!');
@@ -957,7 +1036,9 @@ bot.launch().then(async () => {
         { command: 'autopost', description: '🚀 Start TMDB Auto-Post' },
         { command: 'adddb', description: '🗄️ Add Extra Supabase DB' },
         { command: 'listdb', description: '📚 View Active DBs' },
-        { command: 'admins', description: '👮 View Admins List' },
+        { command: 'addadmin', description: '👮 Add Bot Admin (Owner)' },
+        { command: 'deladmin', description: '🗑️ Remove Bot Admin (Owner)' },
+        { command: 'admins', description: '📋 View Admins List' },
         { command: 'stats', description: '📊 Bot & File Stats' }
       ],
       { scope: { type: 'chat', chat_id: Number(ADMIN_ID) } }
