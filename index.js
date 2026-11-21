@@ -59,6 +59,24 @@ const channelMenuKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback('❌ Cancel', 'addch_cancel')]
 ]);
 
+function normalizeChannelId(rawId) {
+  const digits = String(rawId || '').trim().replace(/^-100/, '').replace(/^-/, '');
+  return digits ? `-100${digits}` : '';
+}
+
+function dedupeChannelList(list = []) {
+  const seen = new Set();
+  const out = [];
+  for (const item of list) {
+    const norm = normalizeChannelId(item);
+    if (norm && !seen.has(norm)) {
+      seen.add(norm);
+      out.push(norm);
+    }
+  }
+  return out;
+}
+
 // Load Dynamic DBs, Channels & Admins from Main Supabase
 async function loadDynamicConfig() {
   try {
@@ -70,12 +88,19 @@ async function loadDynamicConfig() {
     }));
 
     const { data: chs } = await supabase.from('bot_channels').select('*');
-    channels = { db: [], marvel: [], series: [], dubbed: [], telugu: [] };
+    const rawMap = { db: [], marvel: [], series: [], dubbed: [], telugu: [] };
     for (const c of chs || []) {
-      if (channels[c.channel_type]) {
-        channels[c.channel_type].push(String(c.channel_id));
+      if (rawMap[c.channel_type]) {
+        rawMap[c.channel_type].push(String(c.channel_id));
       }
     }
+    channels = {
+      db: dedupeChannelList(rawMap.db),
+      marvel: dedupeChannelList(rawMap.marvel),
+      series: dedupeChannelList(rawMap.series),
+      dubbed: dedupeChannelList(rawMap.dubbed),
+      telugu: dedupeChannelList(rawMap.telugu)
+    };
 
     const { data: admins } = await supabase.from('bot_admins').select('user_id');
     extraAdmins = (admins || []).map((a) => String(a.user_id));
@@ -244,7 +269,6 @@ async function fetchTmdbInfo(title, year, isSeries) {
     let data = await res.json();
     let first = data.results?.[0];
 
-    // Fallback without year if not found
     if (!first && year) {
       searchUrl = `https://api.themoviedb.org/3/search/${type}?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(title)}`;
       res = await fetch(searchUrl);
@@ -263,7 +287,6 @@ async function fetchTmdbInfo(title, year, isSeries) {
     const combinedText = `${det.title || det.name || ''} ${det.overview || ''} ${companies.join(' ')} ${networks.join(' ')}`.toLowerCase();
 
     const isMarvelOrDc = /(marvel|dc films|dc entertainment|dc studios|avengers|spider-man|batman|superman|deadpool|wolverine|thunderbolts|loki|daredevil|peacemaker|joker|aquaman|flash|iron man|thor|captain america|x-men)/i.test(combinedText);
-
     const posterPath = det.poster_path || first.poster_path;
 
     return {
@@ -417,7 +440,7 @@ bot.command('channels', (ctx) => {
   if (!isOwnerDM(ctx)) return;
   const text =
     `📢 <b>Connected Channels:</b>\n\n` +
-    `🗄️ <b>Storage (DB):</b> ${channels.db.join(', ') || DB_CHANNEL_ID}\n` +
+    `🗄️ <b>Storage (DB):</b> ${channels.db.join(', ') || normalizeChannelId(DB_CHANNEL_ID)}\n` +
     `🦸 <b>Marvel & DC:</b> ${channels.marvel.join(', ') || 'None'}\n` +
     `📺 <b>Web Series:</b> ${channels.series.join(', ') || 'None'}\n` +
     `🗣️ <b>Telugu Dubbed:</b> ${channels.dubbed.join(', ') || 'None'}\n` +
@@ -428,13 +451,35 @@ bot.command('channels', (ctx) => {
 
 bot.command('delchannel', async (ctx) => {
   if (!isOwnerDM(ctx)) return;
-  const chId = ctx.message.text.replace('/delchannel', '').trim();
-  if (!/^-?\d+$/.test(chId)) return ctx.reply('❌ Usage: <code>/delchannel -1001234567890</code>', { parse_mode: 'HTML' });
+  const rawInput = ctx.message.text.replace('/delchannel', '').trim();
+  if (!/^-?\d+$/.test(rawInput)) {
+    return ctx.reply('❌ Usage: <code>/delchannel -1001234567890</code>', { parse_mode: 'HTML' });
+  }
 
-  const { error } = await supabase.from('bot_channels').delete().eq('channel_id', chId);
-  if (error) return ctx.reply(`❌ DB Error: <code>${escapeHTML(error.message)}</code>`, { parse_mode: 'HTML' });
+  const cleanTarget = rawInput.replace(/^-100/, '').replace(/^-/, '');
+  const { data: rows, error: fetchErr } = await supabase.from('bot_channels').select('id, channel_id');
+  if (fetchErr) {
+    return ctx.reply(`❌ DB Error: <code>${escapeHTML(fetchErr.message)}</code>`, { parse_mode: 'HTML' });
+  }
+
+  const matchingIds = (rows || [])
+    .filter((r) => {
+      const cleanRow = String(r.channel_id).replace(/^-100/, '').replace(/^-/, '');
+      return String(r.channel_id) === rawInput || cleanRow === cleanTarget;
+    })
+    .map((r) => r.id);
+
+  if (matchingIds.length === 0) {
+    return ctx.reply(`⚠️ Channel <code>${escapeHTML(rawInput)}</code> database lo kanipinchaledu.`, { parse_mode: 'HTML' });
+  }
+
+  const { error: delErr } = await supabase.from('bot_channels').delete().in('id', matchingIds);
+  if (delErr) {
+    return ctx.reply(`❌ Delete Error: <code>${escapeHTML(delErr.message)}</code>`, { parse_mode: 'HTML' });
+  }
+
   await loadDynamicConfig();
-  ctx.reply(`🗑️ Channel <code>${chId}</code> removed.`, { parse_mode: 'HTML' });
+  ctx.reply(`🗑️ Channel <code>${escapeHTML(rawInput)}</code> (${matchingIds.length} record(s)) removed!`, { parse_mode: 'HTML' });
 });
 
 bot.command('adddb', (ctx) => {
@@ -449,15 +494,15 @@ bot.command('listdb', (ctx) => {
   ctx.reply(`🗄️ <b>Active Databases:</b>\n\n<b>Main:</b> ${process.env.SUPABASE_URL || 'Default'}\n\n<b>Extra:</b>\n${escapeHTML(list)}`, { parse_mode: 'HTML' });
 });
 
-// ================= FAST TMDB 4-CHANNEL AUTO-POSTER (POSTER + TITLE + BATCH LINK) =================
+// ================= FAST TMDB 4-CHANNEL AUTO-POSTER =================
 bot.command('autopost', async (ctx) => {
   if (!isOwnerDM(ctx)) return;
-  await ctx.reply('🔄 Scanning Supabase DBs & posting movies/series with Posters & Batch Links...');
+  await ctx.reply('🔄 Scanning Supabase DBs & posting movies/series with Posters, Titles & Batch Links...');
 
   let allFiles = [];
   const dbsToRead = [supabase, ...extraDbs.map((d) => d.client)];
   for (const client of dbsToRead) {
-    const { data } = await client.from('movies_index').select('file_name, message_id, channel_id').limit(5000);
+    const { data } = await client.from('movies_index').select('file_name, message_id, channel_id, file_size').limit(5000);
     if (data) allFiles = allFiles.concat(data);
   }
 
@@ -468,7 +513,7 @@ bot.command('autopost', async (ctx) => {
   const groups = new Map();
   for (const f of allFiles) {
     if (!f.message_id) continue;
-    const chId = String(f.channel_id || DB_CHANNEL_ID);
+    const chId = normalizeChannelId(f.channel_id || DB_CHANNEL_ID);
     const meta = parseFileMeta(f.file_name);
     if (!groups.has(meta.groupKey)) {
       groups.set(meta.groupKey, {
@@ -481,7 +526,12 @@ bot.command('autopost', async (ctx) => {
     const g = groups.get(meta.groupKey);
     meta.langs.forEach((l) => g.langs.add(l));
     g.qualities.add(meta.quality);
-    g.items.push({ channel_id: chId, message_id: f.message_id });
+    g.items.push({
+      channel_id: chId,
+      message_id: f.message_id,
+      file_name: f.file_name,
+      file_size: f.file_size
+    });
   }
 
   const { data: existing } = await supabase.from('movie_batches').select('movie_key').eq('posted', true);
@@ -532,12 +582,18 @@ bot.command('autopost', async (ctx) => {
       }
 
       const seasonTag = g.meta.isSeries && g.meta.seasonNum ? ` • Season ${g.meta.seasonNum}` : '';
+      const fileLines = g.items.slice(0, 4).map((it, idx) => {
+        const sz = it.file_size ? ` (${it.file_size})` : '';
+        return `  ${idx + 1}. <code>${escapeHTML(it.file_name || 'File')}${escapeHTML(sz)}</code>`;
+      }).join('\n');
+
       const caption =
         `🎬 <b>${escapeHTML(finalTitle)}${seasonTag} (${escapeHTML(finalYear)})</b>\n\n` +
         `🔊 <b>Audio:</b> ${escapeHTML(langsText)}\n` +
         `🎞️ <b>Quality:</b> ${escapeHTML(qualsText)}\n` +
-        `📦 <b>Batch Files:</b> ${g.items.length} File(s)\n\n` +
-        `🔗 <b>Batch Link:</b> <a href="${deepLink}">Click Here to Get All Files</a>`;
+        `📦 <b>Batch Files:</b> ${g.items.length} File(s)\n` +
+        (fileLines ? `📁 <b>Files:</b>\n${fileLines}\n` : '') +
+        `\n🔗 <b>Batch Link:</b> <a href="${deepLink}">Get All Files Now</a>`;
 
       const keyboard = Markup.inlineKeyboard([
         [Markup.button.url('⚡ Get Batch Files', deepLink)]
@@ -590,7 +646,7 @@ bot.on('channel_post', async (ctx) => {
 
   const record = {
     message_id: post.message_id,
-    channel_id: String(post.chat.id),
+    channel_id: normalizeChannelId(post.chat.id),
     file_name: cleanName,
     file_size: fileSize,
     quality,
@@ -653,7 +709,7 @@ async function deliverFiles(ctx, items, labelName) {
 
   for (const item of items) {
     const msgId = typeof item === 'object' ? item.message_id : item;
-    const chId = typeof item === 'object' && item.channel_id ? item.channel_id : DB_CHANNEL_ID;
+    const chId = normalizeChannelId(typeof item === 'object' && item.channel_id ? item.channel_id : DB_CHANNEL_ID);
 
     try {
       const { data: movie } = await supabase
@@ -662,12 +718,13 @@ async function deliverFiles(ctx, items, labelName) {
         .eq('message_id', msgId)
         .single();
 
-      const rawTitle = movie ? movie.file_name : 'Watch Movie';
+      const rawTitle = movie ? movie.file_name : (item.file_name || 'Watch Movie');
+      const fileSize = movie?.file_size || item.file_size || '';
       lastTitle = rawTitle;
 
       const customCaption =
         `<a href="${GROUP_LINK}"><b>${escapeHTML(rawTitle)}</b></a>\n\n` +
-        (movie?.file_size ? `💾 <a href="${GROUP_LINK}"><b>Size: ${escapeHTML(movie.file_size)}</b></a>\n\n` : '') +
+        (fileSize ? `💾 <a href="${GROUP_LINK}"><b>Size: ${escapeHTML(fileSize)}</b></a>\n\n` : '') +
         `📢 <a href="${GROUP_LINK}"><b>Join Our Movies Group</b></a>`;
 
       const sent = await ctx.telegram.copyMessage(ctx.chat.id, chId, msgId, {
@@ -775,13 +832,14 @@ bot.on('message', async (ctx, next) => {
   if (!state) return next();
 
   if (state.action === 'awaiting_channel') {
-    let chId = null;
+    let rawId = null;
     if (ctx.message.forward_from_chat && ctx.message.forward_from_chat.type === 'channel') {
-      chId = String(ctx.message.forward_from_chat.id);
+      rawId = String(ctx.message.forward_from_chat.id);
     } else if (ctx.message.text && /^-?\d+$/.test(ctx.message.text.trim())) {
-      chId = ctx.message.text.trim();
+      rawId = ctx.message.text.trim();
     }
 
+    const chId = normalizeChannelId(rawId);
     if (!chId) {
       return ctx.reply('❌ Invalid Channel ID. Forward a message from the channel or send <code>-100...</code> ID.', { parse_mode: 'HTML' });
     }
