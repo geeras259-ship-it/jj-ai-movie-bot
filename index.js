@@ -34,7 +34,7 @@ const FALLBACK_SHARES = [
   '🔥 Mass print ichanu mawa! Full enjoy chesi, mana group ni friends ki share cheyadam marchipoku! ✌️'
 ];
 
-// Dynamic Multi-Supabase, Admins & Channels State
+// Dynamic Multi-Supabase, Admins, Channels & Settings State
 let extraDbs = [];     // [{ url, key, client }]
 let extraAdmins = [];  // ['123456789', ...]
 let channels = {
@@ -45,6 +45,7 @@ let channels = {
   dubbed: [],  // Hollywood Telugu Dubbed
   telugu: []   // Telugu & Remaining
 };
+let activeGroupLink = GROUP_LINK;
 const adminState = new Map();
 const pendingAutoPosts = new Map();
 
@@ -86,7 +87,7 @@ function dedupeChannelList(list = []) {
   return out;
 }
 
-// Load Dynamic DBs, Channels & Admins from Main Supabase
+// Load Dynamic DBs, Channels, Admins & Settings from Main Supabase
 async function loadDynamicConfig() {
   try {
     const { data: dbs } = await supabase.from('bot_databases').select('*');
@@ -114,6 +115,14 @@ async function loadDynamicConfig() {
 
     const { data: admins } = await supabase.from('bot_admins').select('user_id');
     extraAdmins = (admins || []).map((a) => String(a.user_id));
+
+    try {
+      const { data: settings } = await supabase.from('bot_settings').select('setting_key, setting_value');
+      const linkRow = (settings || []).find((s) => s.setting_key === 'group_link');
+      activeGroupLink = (linkRow?.setting_value || GROUP_LINK).trim();
+    } catch (e) {
+      activeGroupLink = GROUP_LINK;
+    }
 
     console.log(`✅ Loaded ${extraDbs.length} extra DBs, ${(chs || []).length} channels, ${extraAdmins.length} extra admins.`);
   } catch (err) {
@@ -492,6 +501,7 @@ function getAdminPanelText() {
     `• /addchannel - Add Category Channel\n` +
     `• /channels - View Connected Channels\n` +
     `• /delchannel - Remove Channel\n` +
+    `• /setlink - Change File Caption Link\n` +
     `• /autopost - Safe Year-Wise Auto-Post\n` +
     `• /stopautopost - Stop Running Auto-Post\n` +
     `• /clearposts - 1-Click Clear Category Channel\n` +
@@ -530,6 +540,35 @@ bot.command('admin', (ctx) => {
   ctx.reply(getAdminPanelText(), {
     parse_mode: 'HTML',
     ...Markup.inlineKeyboard([[Markup.button.callback('📢 Add Channel', 'addch_back')]])
+  });
+});
+
+bot.command('setlink', async (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  const newLink = ctx.message.text.replace('/setlink', '').trim();
+  if (!/^https?:\/\/\S+/i.test(newLink)) {
+    return ctx.reply(
+      `❌ Usage: <code>/setlink https://t.me/+YourGroupLink</code>\n\n📌 Current Link: <code>${escapeHTML(activeGroupLink)}</code>`,
+      { parse_mode: 'HTML' }
+    );
+  }
+
+  activeGroupLink = newLink;
+  try {
+    const { error } = await supabase
+      .from('bot_settings')
+      .upsert({ setting_key: 'group_link', setting_value: newLink }, { onConflict: 'setting_key' });
+
+    if (error) {
+      return ctx.reply(
+        `✅ Link updated live to <code>${escapeHTML(newLink)}</code>!\n⚠️ <i>(DB note: <code>${escapeHTML(error.message)}</code>)</i>`,
+        { parse_mode: 'HTML' }
+      );
+    }
+  } catch (e) {}
+
+  ctx.reply(`✅ Group link updated! Ippudu nunchi files caption lo ee link vasthundi:\n<code>${escapeHTML(newLink)}</code>`, {
+    parse_mode: 'HTML'
   });
 });
 
@@ -1098,9 +1137,9 @@ async function deliverFiles(ctx, items, labelName) {
 
       const samplePrefix = item.isSample ? `🎞️ <b>[SAMPLE VIDEO]</b>\n` : '';
       const customCaption =
-        `${samplePrefix}<a href="${GROUP_LINK}"><b>${escapeHTML(rawTitle)}</b></a>\n\n` +
-        (fileSize ? `💾 <a href="${GROUP_LINK}"><b>Size: ${escapeHTML(fileSize)}</b></a>\n\n` : '') +
-        `📢 <a href="${GROUP_LINK}"><b>Join Our Movies Group</b></a>`;
+        `${samplePrefix}<a href="${activeGroupLink}"><b>${escapeHTML(rawTitle)}</b></a>\n\n` +
+        (fileSize ? `💾 <a href="${activeGroupLink}"><b>Size: ${escapeHTML(fileSize)}</b></a>\n\n` : '') +
+        `📢 <a href="${activeGroupLink}"><b>Join Our Movies Group</b></a>`;
 
       const sent = await ctx.telegram.copyMessage(ctx.chat.id, chId, msgId, {
         caption: customCaption,
@@ -1116,7 +1155,7 @@ async function deliverFiles(ctx, items, labelName) {
   if (sentIds.length === 0) return ctx.reply('❌ File not found or deleted from storage.');
 
   const shareText = await getUniqueShareMsg(labelName, lastTitle);
-  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(GROUP_LINK)}&text=${encodeURIComponent('🎬 Free HD Movies Group mawa! Join avvu:')}`;
+  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(activeGroupLink)}&text=${encodeURIComponent('🎬 Free HD Movies Group mawa! Join avvu:')}`;
 
   const warnMsg = await ctx.reply(
     `${shareText}\n\n⚠️ <b>Note:</b> Ee file(s) <b>5 minutes</b> lo auto-delete avuthayi. Ventane Saved Messages ki forward chesko!`,
@@ -1168,9 +1207,9 @@ bot.start(async (ctx) => {
       });
       const prompt = `You are a cool AI Movie Assistant Telegram bot. Write a short, unique welcome message (max 3 lines) in Tenglish using "mawa" style for "${labelName}". Vibe: ${vibe}. Tell them to type any movie name in our group for instant HD files. Add movie emojis.`;
       const res = await creativeModel.generateContent(prompt);
-      return ctx.reply(res.response.text().trim(), Markup.inlineKeyboard([[Markup.button.url('🎬 Join Movies Group', GROUP_LINK)]]));
+      return ctx.reply(res.response.text().trim(), Markup.inlineKeyboard([[Markup.button.url('🎬 Join Movies Group', activeGroupLink)]]));
     } catch (e) {
-      return ctx.reply(`🎬 Hey ${labelName} mawa! Welcome to AI Movie Bot.\n\nGroup lo movie name type cheyandi, ventane HD files isthanu! 🍿`, Markup.inlineKeyboard([[Markup.button.url('🎬 Join Movies Group', GROUP_LINK)]]));
+      return ctx.reply(`🎬 Hey ${labelName} mawa! Welcome to AI Movie Bot.\n\nGroup lo movie name type cheyandi, ventane HD files isthanu! 🍿`, Markup.inlineKeyboard([[Markup.button.url('🎬 Join Movies Group', activeGroupLink)]]));
     }
   }
 
@@ -1270,7 +1309,7 @@ async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', b
   const totalPages = Math.ceil(count / limit);
 
   let text = `🎬 <b>${escapeHTML(query)}</b> • <code>${count} Files</code>\n`;
-  text += `⚡ <a href="${GROUP_LINK}">${escapeHTML(tagLabel)}</a>\n`;
+  text += `⚡ <a href="${activeGroupLink}">${escapeHTML(tagLabel)}</a>\n`;
   text += `──────────────\n\n`;
 
   const batchIds = data.slice(0, 5).map(i => i.message_id).join('_');
@@ -1518,6 +1557,7 @@ if (ADMIN_ID) {
       { command: 'addchannel', description: '📢 Add Category Channel' },
       { command: 'channels', description: '📺 View Channels' },
       { command: 'delchannel', description: '🗑️ Remove Channel' },
+      { command: 'setlink', description: '🔗 Change File Caption Link' },
       { command: 'autopost', description: '🚀 Safe Year-Wise Auto-Post' },
       { command: 'stopautopost', description: '🛑 Stop Running Auto-Post' },
       { command: 'clearposts', description: '🧹 1-Click Clear Category Channel' },
