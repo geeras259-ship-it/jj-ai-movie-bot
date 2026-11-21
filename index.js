@@ -494,10 +494,10 @@ bot.command('listdb', (ctx) => {
   ctx.reply(`🗄️ <b>Active Databases:</b>\n\n<b>Main:</b> ${process.env.SUPABASE_URL || 'Default'}\n\n<b>Extra:</b>\n${escapeHTML(list)}`, { parse_mode: 'HTML' });
 });
 
-// ================= FAST TMDB 4-CHANNEL AUTO-POSTER =================
+// ================= FAST TMDB 4-CHANNEL AUTO-POSTER (MINIMAL POSTER + LINK) =================
 bot.command('autopost', async (ctx) => {
   if (!isOwnerDM(ctx)) return;
-  await ctx.reply('🔄 Scanning Supabase DBs & posting movies/series with Posters, Titles & Batch Links...');
+  await ctx.reply('🔄 Scanning Supabase DBs & posting movies/series...');
 
   let allFiles = [];
   const dbsToRead = [supabase, ...extraDbs.map((d) => d.client)];
@@ -549,8 +549,6 @@ bot.command('autopost', async (ctx) => {
       const finalTitle = tmdb?.title || g.meta.title;
       const finalYear = tmdb?.year || g.meta.year || 'N/A';
       const langsArr = Array.from(g.langs);
-      const langsText = langsArr.length > 0 ? langsArr.join(', ') : 'Telugu';
-      const qualsText = Array.from(g.qualities).join(', ');
 
       // Priority: 1. Marvel/DC -> 2. Web Series -> 3. Hollywood Telugu Dubbed -> 4. Telugu/Remaining
       let targetType = 'telugu';
@@ -581,37 +579,22 @@ bot.command('autopost', async (ctx) => {
         return;
       }
 
-      const seasonTag = g.meta.isSeries && g.meta.seasonNum ? ` • Season ${g.meta.seasonNum}` : '';
-      const fileLines = g.items.slice(0, 4).map((it, idx) => {
-        const sz = it.file_size ? ` (${it.file_size})` : '';
-        return `  ${idx + 1}. <code>${escapeHTML(it.file_name || 'File')}${escapeHTML(sz)}</code>`;
-      }).join('\n');
-
+      const seasonTag = g.meta.isSeries && g.meta.seasonNum ? ` Season ${g.meta.seasonNum}` : '';
+      const audioLabel = langsArr.length > 0 ? langsArr.join(' + ') : 'Telugu';
       const caption =
-        `🎬 <b>${escapeHTML(finalTitle)}${seasonTag} (${escapeHTML(finalYear)})</b>\n\n` +
-        `🔊 <b>Audio:</b> ${escapeHTML(langsText)}\n` +
-        `🎞️ <b>Quality:</b> ${escapeHTML(qualsText)}\n` +
-        `📦 <b>Batch Files:</b> ${g.items.length} File(s)\n` +
-        (fileLines ? `📁 <b>Files:</b>\n${fileLines}\n` : '') +
-        `\n🔗 <b>Batch Link:</b> <a href="${deepLink}">Get All Files Now</a>`;
-
-      const keyboard = Markup.inlineKeyboard([
-        [Markup.button.url('⚡ Get Batch Files', deepLink)]
-      ]);
+        `<b>${escapeHTML(finalTitle)}${seasonTag} (${escapeHTML(finalYear)}) ${escapeHTML(audioLabel)}</b>\n\n` +
+        `${deepLink}`;
 
       for (const targetCh of targetChannels) {
         try {
           if (tmdb?.posterUrl) {
             await ctx.telegram.sendPhoto(targetCh, tmdb.posterUrl, {
               caption,
-              parse_mode: 'HTML',
-              ...keyboard
+              parse_mode: 'HTML'
             });
           } else {
             await ctx.telegram.sendMessage(targetCh, caption, {
-              parse_mode: 'HTML',
-              disable_web_page_preview: false,
-              ...keyboard
+              parse_mode: 'HTML'
             });
           }
           postedCount++;
