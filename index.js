@@ -50,6 +50,7 @@ let realtimeAutoPostEnabled = false; // Default OFF: nuvvu ON chesthene DB files
 let fileDeleteMinutes = 5;           // Dynamic file auto-delete timer (0 = OFF)
 let autoAnnounceEnabled = true;      // Daily 5 auto-expiring movie spotlights
 let lastAnnounceMsgId = null;        // Tracks last group announcement for auto-expire
+let lastSpotlightTargets = [];       // Tracks last spotlight across Group + linked display channels [{ chatId, messageId }]
 const recentSpotlights = new Set();
 
 const adminState = new Map();
@@ -165,6 +166,14 @@ async function loadDynamicConfig() {
 
       const lastAnnId = parseInt(getVal('last_announce_msg_id'), 10);
       if (!isNaN(lastAnnId)) lastAnnounceMsgId = lastAnnId;
+
+      const spotlightTargetsRaw = getVal('last_spotlight_targets');
+      if (spotlightTargetsRaw) {
+        try {
+          const parsed = JSON.parse(spotlightTargetsRaw);
+          if (Array.isArray(parsed)) lastSpotlightTargets = parsed;
+        } catch (e) {}
+      }
     } catch (e) {
       activeGroupLink = GROUP_LINK;
     }
@@ -607,15 +616,44 @@ async function clearChannelMessages(targetCh, maxId) {
   return deleted;
 }
 
-// ================= DAILY AUTO-EXPIRING SPOTLIGHT (5 MOVIES / DAY) =================
+// ================= DAILY AUTO-EXPIRING SPOTLIGHT (GROUP + LINKED CHANNELS) =================
+function getSpotlightTargetChats() {
+  const displayChannels = [
+    ...(channels.theatre || []),
+    ...(channels.marvel || []),
+    ...(channels.series || []),
+    ...(channels.dubbed || []),
+    ...(channels.telugu || [])
+  ];
+
+  const allTargets = [TARGET_GROUP_ID, ...displayChannels]
+    .map((id) => normalizeChannelId(id))
+    .filter(Boolean);
+
+  return Array.from(new Set(allTargets));
+}
+
 async function clearPreviousAnnouncement() {
-  if (!TARGET_GROUP_ID || !lastAnnounceMsgId) return;
-  await bot.telegram.deleteMessage(TARGET_GROUP_ID, lastAnnounceMsgId).catch(() => {});
-  lastAnnounceMsgId = null;
+  if (Array.isArray(lastSpotlightTargets) && lastSpotlightTargets.length > 0) {
+    for (const item of lastSpotlightTargets) {
+      if (item?.chatId && item?.messageId) {
+        await bot.telegram.deleteMessage(item.chatId, item.messageId).catch(() => {});
+        await sleep(300);
+      }
+    }
+    lastSpotlightTargets = [];
+  } else if (TARGET_GROUP_ID && lastAnnounceMsgId) {
+    await bot.telegram.deleteMessage(TARGET_GROUP_ID, lastAnnounceMsgId).catch(() => {});
+    lastAnnounceMsgId = null;
+  }
+  await saveSetting('last_spotlight_targets', JSON.stringify([]));
 }
 
 async function postDailySpotlight() {
-  if (!autoAnnounceEnabled || !TARGET_GROUP_ID) return;
+  if (!autoAnnounceEnabled) return;
+
+  const targetChats = getSpotlightTargetChats();
+  if (targetChats.length === 0) return;
 
   try {
     const { count } = await supabase.from('movies_index').select('*', { count: 'exact', head: true });
@@ -653,19 +691,36 @@ async function postDailySpotlight() {
       `Available now in our official channel! You can also type any movie name right here in the group to get instant files.\n\n` +
       `<i>⏳ This spotlight auto-updates with a new movie every few hours.</i>`;
 
-    const sent = await bot.telegram.sendMessage(TARGET_GROUP_ID, text, {
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      ...Markup.inlineKeyboard([
-        [
-          Markup.button.url('🎬 ɢᴇᴛ ᴍᴏᴠɪᴇ', movieLink),
-          Markup.button.url('📢 ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ', activeGroupLink)
-        ]
-      ])
-    });
+    const kb = Markup.inlineKeyboard([
+      [
+        Markup.button.url('🎬 ɢᴇᴛ ᴍᴏᴠɪᴇ', movieLink),
+        Markup.button.url('📢 ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ', activeGroupLink)
+      ]
+    ]);
 
-    lastAnnounceMsgId = sent.message_id;
-    await saveSetting('last_announce_msg_id', lastAnnounceMsgId);
+    const postedList = [];
+    for (const chatId of targetChats) {
+      try {
+        const sent = await sendWithFloodGuard(() =>
+          bot.telegram.sendMessage(chatId, text, {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+            ...kb
+          })
+        );
+        postedList.push({ chatId, messageId: sent.message_id });
+        if (chatId === normalizeChannelId(TARGET_GROUP_ID)) {
+          lastAnnounceMsgId = sent.message_id;
+          await saveSetting('last_announce_msg_id', lastAnnounceMsgId);
+        }
+        await sleep(800);
+      } catch (err) {
+        console.error(`Spotlight post failed in ${chatId}:`, err.message);
+      }
+    }
+
+    lastSpotlightTargets = postedList;
+    await saveSetting('last_spotlight_targets', JSON.stringify(postedList));
   } catch (e) {
     console.error('Spotlight error:', e.message);
   }
@@ -714,9 +769,11 @@ bot.command('toggleannounce', async (ctx) => {
 
 bot.command('spotlightnow', async (ctx) => {
   if (!isOwnerDM(ctx)) return;
-  if (!TARGET_GROUP_ID) return ctx.reply('❌ GROUP_ID is not set in environment variables.');
+  if (getSpotlightTargetChats().length === 0) {
+    return ctx.reply('❌ No GROUP_ID or display channels configured.');
+  }
   await postDailySpotlight();
-  ctx.reply('✅ Movie spotlight posted to official group!');
+  ctx.reply('✅ Movie spotlight posted to official group & linked channels!');
 });
 
 bot.command('announce', async (ctx) => {
@@ -751,7 +808,9 @@ bot.command('announce', async (ctx) => {
     }
 
     lastAnnounceMsgId = sent.message_id;
+    lastSpotlightTargets = [{ chatId: normalizeChannelId(TARGET_GROUP_ID), messageId: sent.message_id }];
     await saveSetting('last_announce_msg_id', lastAnnounceMsgId);
+    await saveSetting('last_spotlight_targets', JSON.stringify(lastSpotlightTargets));
     ctx.reply('✅ Custom announcement posted to official group! (Previous announcement cleared)');
   } catch (e) {
     ctx.reply(`❌ Failed to announce: <code>${escapeHTML(e.message)}</code>`, { parse_mode: 'HTML' });
