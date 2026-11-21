@@ -1,4 +1,4 @@
- const { Telegraf, Markup } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const express = require('express');
@@ -54,11 +54,12 @@ const pendingAutoPosts = new Map();
 let isAutoPosting = false;
 let stopAutoPostFlag = false;
 
-// 80% Limit / Storage Early Warning Config
+// 80% Limit / Storage Early Warning Config (Approx ~1 KB metadata per row in Postgres)
 const DB_MAX_ROWS = 50000;
-const DB_WARN_THRESHOLD = Math.floor(DB_MAX_ROWS * 0.8); // 40,000 (80%)
+const DB_WARN_THRESHOLD = Math.floor(DB_MAX_ROWS * 0.8); // 40,000 rows (80%)
 const DB_MAX_MB = 500;
 const DB_WARN_MB = Math.floor(DB_MAX_MB * 0.8); // 400 MB (80%)
+const KB_PER_ROW = 1;
 let lastDbQuotaAlertAt = 0;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -159,28 +160,20 @@ async function notifyOwnerDbAlert(reasonText) {
 
 async function checkSupabaseThreshold(client = supabase) {
   try {
-    const { data, count } = await client
+    const { count } = await client
       .from('movies_index')
-      .select('file_size', { count: 'exact' })
-      .limit(5000);
+      .select('*', { count: 'exact', head: true });
 
-    let approxMb = 0;
-    for (const row of data || []) {
-      const s = String(row.file_size || '');
-      const num = parseFloat(s);
-      if (!isNaN(num)) {
-        approxMb += /gb/i.test(s) ? num * 1024 : num;
-      }
-    }
+    const rowCount = count ?? 0;
+    const estMetadataMb = (rowCount * KB_PER_ROW) / 1024;
+    const rowPct = Math.round((rowCount / DB_MAX_ROWS) * 100);
+    const sizePct = Math.round((estMetadataMb / DB_MAX_MB) * 100);
 
-    const rowPct = typeof count === 'number' ? Math.round((count / DB_MAX_ROWS) * 100) : 0;
-    const sizePct = Math.round((approxMb / DB_MAX_MB) * 100);
-
-    if ((typeof count === 'number' && count >= DB_WARN_THRESHOLD) || approxMb >= DB_WARN_MB) {
+    if (rowCount >= DB_WARN_THRESHOLD || estMetadataMb >= DB_WARN_MB) {
       await notifyOwnerDbAlert(
         `📊 <b>Usage Reached ~${Math.max(rowPct, sizePct)}% (80% Threshold)</b>\n` +
-        `• Rows: <code>${count ?? 0}</code> / <code>${DB_MAX_ROWS}</code>\n` +
-        `• Indexed Size Sum: <code>${approxMb.toFixed(0)} MB</code> / <code>${DB_MAX_MB} MB</code>`
+        `• Rows: <code>${rowCount}</code> / <code>${DB_MAX_ROWS}</code>\n` +
+        `• Est. DB Metadata: <code>${estMetadataMb.toFixed(2)} MB</code> / <code>${DB_MAX_MB} MB</code>`
       );
     }
   } catch (e) {}
@@ -741,35 +734,26 @@ bot.command('listdb', async (ctx) => {
 
   for (const dbItem of allDbs) {
     try {
-      const { data, count, error } = await dbItem.client
+      const { count, error } = await dbItem.client
         .from('movies_index')
-        .select('file_size', { count: 'exact' })
-        .limit(5000);
+        .select('*', { count: 'exact', head: true });
 
       if (error) {
         text += `• <b>${dbItem.label}</b> (${escapeHTML(dbItem.url)})\n   ❌ Error: <code>${escapeHTML(error.message)}</code>\n\n`;
         continue;
       }
 
-      let totalMb = 0;
-      for (const r of data || []) {
-        const raw = String(r.file_size || '');
-        const num = parseFloat(raw);
-        if (!isNaN(num)) {
-          totalMb += /gb/i.test(raw) ? num * 1024 : num;
-        }
-      }
-
-      const rowCount = count ?? (data ? data.length : 0);
-      const sizePct = Math.min(100, ((totalMb / DB_MAX_MB) * 100).toFixed(1));
-      const rowPct = Math.min(100, ((rowCount / DB_MAX_ROWS) * 100).toFixed(1));
-      const maxPct = Math.max(parseFloat(sizePct), parseFloat(rowPct));
+      const rowCount = count ?? 0;
+      const estMetadataMb = Number(((rowCount * KB_PER_ROW) / 1024).toFixed(2));
+      const sizePct = Math.min(100, Number(((estMetadataMb / DB_MAX_MB) * 100).toFixed(1)));
+      const rowPct = Math.min(100, Number(((rowCount / DB_MAX_ROWS) * 100).toFixed(1)));
+      const maxPct = Math.max(sizePct, rowPct);
       const statusEmoji = maxPct >= 80 ? '🚨' : maxPct >= 50 ? '⚠️' : '🟢';
 
       text +=
         `${statusEmoji} <b>${dbItem.label}</b>\n` +
         `   🔗 <code>${escapeHTML(dbItem.url)}</code>\n` +
-        `   📊 <b>Storage:</b> <code>${sizePct}%</code> (${totalMb.toFixed(0)}/${DB_MAX_MB} MB) | <b>Rows:</b> <code>${rowPct}%</code> (${rowCount}/${DB_MAX_ROWS})\n\n`;
+        `   📊 <b>DB Usage:</b> <code>${sizePct}%</code> (${estMetadataMb}/${DB_MAX_MB} MB) | <b>Rows:</b> <code>${rowPct}%</code> (${rowCount}/${DB_MAX_ROWS})\n\n`;
     } catch (e) {
       text += `• <b>${dbItem.label}:</b> ❌ Failed to fetch usage\n\n`;
     }
