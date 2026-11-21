@@ -236,8 +236,8 @@ function parseFileMeta(rawName) {
     .replace(/\.(mkv|mp4|avi|mov|webm)$/i, '')
     .replace(/[\._]/g, ' ');
 
-  const isSeries = /\b(S\d{1,2}|Season\s*\d{1,2}|E\d{1,2}|EP\s*\d{1,2})\b/i.test(cleanStr);
-  const seasonMatch = cleanStr.match(/\b(?:S|Season\s*)0?(\d{1,2})\b/i);
+  const isSeries = /\b(S\d{1,2}\s*E\d{1,2}|S\d{1,2}|Season\s*\d{1,2}|E\d{1,2}|EP\s*\d{1,2}|Episode\s*\d{1,2})\b/i.test(cleanStr);
+  const seasonMatch = cleanStr.match(/\b(?:S|Season\s*)0?(\d{1,2})(?:\s*E\d{1,2}|\b)/i);
   const seasonNum = seasonMatch ? parseInt(seasonMatch[1], 10) : null;
 
   const isSample = /\b(sample\s*video|print\s*sample|video\s*sample|sample)\b/i.test(cleanStr);
@@ -260,7 +260,7 @@ function parseFileMeta(rawName) {
 
   let title = cleanStr
     .replace(/\b(19\d{2}|20\d{2})\b.*/i, '')
-    .replace(/\b(S\d{1,2}|Season\s*\d+|E\d{1,2}|EP\s*\d+|480p|720p|1080p|2160p|4K|WEB-DL|WEBRip|HDRip|BluRay|HQ|PreDVD|PreDVDRip|HDCAM|CAMRip|HQCAM|HDTS|TSRip|Telesync|DVDScr|Theatre\s*Print|Cam\s*Print|S-Print|CAM|TS|V\d+|Sample\s*Video|Sample|Rip|Dual\s*Audio|Telugu|Tamil|Hindi|English|Malayalam|Kannada|Dubbed|Uncut|ESub|x264|x265|HEVC|10bit|AAC|5\.1|2\.0)\b.*/i, '')
+    .replace(/\b(S\d{1,2}\s*E\d{1,2}|S\d{1,2}|Season\s*\d+|E\d{1,2}|EP\s*\d+|Episode\s*\d+|480p|720p|1080p|2160p|4K|WEB-DL|WEBRip|HDRip|BluRay|HQ|PreDVD|PreDVDRip|HDCAM|CAMRip|HQCAM|HDTS|TSRip|Telesync|DVDScr|Theatre\s*Print|Cam\s*Print|S-Print|CAM|TS|V\d+|Sample\s*Video|Sample|Rip|Dual\s*Audio|Telugu|Tamil|Hindi|English|Malayalam|Kannada|Dubbed|Uncut|ESub|x264|x265|HEVC|10bit|AAC|5\.1|2\.0)\b.*/i, '')
     .replace(/[\(\)\[\]\{\}\-–—_]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -273,7 +273,7 @@ function parseFileMeta(rawName) {
   return { title, year, langs, quality, isSeries, seasonNum, isCamPrint, isSample, isTheatreFile, groupKey };
 }
 
-// Strict Category Resolver (Indian movies NEVER go into Hollywood Dubbed)
+// Strict Category Resolver (Theatre -> Marvel/DC including X-Men -> Series -> Dubbed -> Telugu)
 function resolveCategory(meta, tmdb, langsArr) {
   if (meta.isTheatreFile) return 'theatre';
   if (tmdb?.isMarvelOrDc) return 'marvel';
@@ -402,7 +402,7 @@ async function fetchTmdbInfo(title, year, isSeries) {
       const networks = (det.networks || []).map((n) => n.name.toLowerCase());
       const combinedText = `${det.title || det.name || ''} ${det.overview || ''} ${companies.join(' ')} ${networks.join(' ')}`.toLowerCase();
 
-      isMarvelOrDc = /(marvel|dc films|dc entertainment|dc studios|avengers|spider-man|batman|superman|deadpool|wolverine|thunderbolts|loki|daredevil|peacemaker|joker|aquaman|flash|iron man|thor|captain america|x-men)/i.test(combinedText);
+      isMarvelOrDc = /(marvel|dc films|dc entertainment|dc studios|avengers|spider-man|batman|superman|deadpool|wolverine|thunderbolts|loki|daredevil|peacemaker|joker|aquaman|flash|iron man|thor|captain america|x-men|x men|magneto|cyclops|storm|mystique|logan)/i.test(combinedText);
 
       const backdrops = det.images?.backdrops || [];
       const titledBanner = backdrops.find((b) => b.iso_639_1 === 'en' || b.iso_639_1 === 'te');
