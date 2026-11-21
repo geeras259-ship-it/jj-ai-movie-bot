@@ -47,6 +47,11 @@ let channels = {
 };
 let activeGroupLink = GROUP_LINK;
 let realtimeAutoPostEnabled = false; // Default OFF: nuvvu ON chesthene DB files live update avuthayi
+let fileDeleteMinutes = 5;           // Dynamic file auto-delete timer (0 = OFF)
+let autoAnnounceEnabled = true;      // Daily 5 auto-expiring movie spotlights
+let lastAnnounceMsgId = null;        // Tracks last group announcement for auto-expire
+const recentSpotlights = new Set();
+
 const adminState = new Map();
 const pendingAutoPosts = new Map();
 
@@ -92,6 +97,28 @@ function dedupeChannelList(list = []) {
   return out;
 }
 
+async function saveSetting(key, value) {
+  try {
+    await supabase
+      .from('bot_settings')
+      .upsert({ setting_key: key, setting_value: String(value) }, { onConflict: 'setting_key' });
+  } catch (e) {}
+}
+
+async function registerUser(user) {
+  if (!user || user.is_bot) return;
+  try {
+    await supabase.from('bot_users').upsert(
+      {
+        user_id: user.id,
+        first_name: user.first_name || '',
+        username: user.username || ''
+      },
+      { onConflict: 'user_id' }
+    );
+  } catch (e) {}
+}
+
 // Load Dynamic DBs, Channels, Admins & Settings from Main Supabase
 async function loadDynamicConfig() {
   try {
@@ -123,18 +150,26 @@ async function loadDynamicConfig() {
 
     try {
       const { data: settings } = await supabase.from('bot_settings').select('setting_key, setting_value');
-      const linkRow = (settings || []).find((s) => s.setting_key === 'group_link');
-      activeGroupLink = (linkRow?.setting_value || GROUP_LINK).trim();
+      const getVal = (k) => (settings || []).find((s) => s.setting_key === k)?.setting_value;
 
-      const autoPostRow = (settings || []).find((s) => s.setting_key === 'realtime_autopost');
-      if (autoPostRow) {
-        realtimeAutoPostEnabled = autoPostRow.setting_value === 'true';
-      }
+      activeGroupLink = (getVal('group_link') || GROUP_LINK).trim();
+
+      const autoPostVal = getVal('realtime_autopost');
+      if (autoPostVal !== undefined) realtimeAutoPostEnabled = autoPostVal === 'true';
+
+      const delVal = parseInt(getVal('delete_time_mins'), 10);
+      if (!isNaN(delVal)) fileDeleteMinutes = delVal;
+
+      const annVal = getVal('auto_announce');
+      if (annVal !== undefined) autoAnnounceEnabled = annVal === 'true';
+
+      const lastAnnId = parseInt(getVal('last_announce_msg_id'), 10);
+      if (!isNaN(lastAnnId)) lastAnnounceMsgId = lastAnnId;
     } catch (e) {
       activeGroupLink = GROUP_LINK;
     }
 
-    console.log(`✅ Loaded ${extraDbs.length} extra DBs, ${(chs || []).length} channels, ${extraAdmins.length} extra admins. LiveAutoPost=${realtimeAutoPostEnabled}`);
+    console.log(`✅ Loaded ${extraDbs.length} extra DBs, ${(chs || []).length} channels, ${extraAdmins.length} extra admins. LiveAutoPost=${realtimeAutoPostEnabled}, DelTime=${fileDeleteMinutes}m`);
   } catch (err) {
     console.error('Config Load Error:', err.message);
   }
@@ -517,9 +552,18 @@ async function findSpellingOrSimilar(query) {
 
 function getAdminPanelText() {
   const liveStatus = realtimeAutoPostEnabled ? '🟢 ON' : '🔴 OFF';
+  const annStatus = autoAnnounceEnabled ? '🟢 ON' : '🔴 OFF';
+  const delStatus = fileDeleteMinutes === 0 ? 'OFF' : `${fileDeleteMinutes}m`;
   return (
     `👑 <b>JJ FILES ADMIN PANEL</b>\n\n` +
-    `⚡ <b>Live Channel Update:</b> ${liveStatus} (<code>/toggleautopost</code>)\n\n` +
+    `⚡ <b>Live Channel Update:</b> ${liveStatus} (<code>/toggleautopost</code>)\n` +
+    `📢 <b>Daily Spotlights (5/day):</b> ${annStatus} (<code>/toggleannounce</code>)\n` +
+    `⏱️ <b>File Auto-Delete:</b> <code>${delStatus}</code> (<code>/setdeltime</code>)\n\n` +
+    `• /setdeltime - Set File Auto-Delete Timer (mins)\n` +
+    `• /announce - Post Custom Group Announcement\n` +
+    `• /spotlightnow - Trigger Movie Spotlight Now\n` +
+    `• /toggleannounce - ON/OFF Daily 5 Spotlights\n` +
+    `• /broadcast - DM Broadcast to All Users\n` +
     `• /toggleautopost - ON/OFF DB Live Channel Updates\n` +
     `• /autopost - Post Remaining Unposted (Year-Wise)\n` +
     `• /stopautopost - Stop Running Auto-Post\n` +
@@ -557,6 +601,71 @@ async function clearChannelMessages(targetCh, maxId) {
   return deleted;
 }
 
+// ================= DAILY AUTO-EXPIRING SPOTLIGHT (5 MOVIES / DAY) =================
+async function clearPreviousAnnouncement() {
+  if (!TARGET_GROUP_ID || !lastAnnounceMsgId) return;
+  await bot.telegram.deleteMessage(TARGET_GROUP_ID, lastAnnounceMsgId).catch(() => {});
+  lastAnnounceMsgId = null;
+}
+
+async function postDailySpotlight() {
+  if (!autoAnnounceEnabled || !TARGET_GROUP_ID) return;
+
+  try {
+    const { count } = await supabase.from('movies_index').select('*', { count: 'exact', head: true });
+    if (!count || count === 0) return;
+
+    let movie = null;
+    for (let tries = 0; tries < 5; tries++) {
+      const randomOffset = Math.floor(Math.random() * count);
+      const { data } = await supabase
+        .from('movies_index')
+        .select('*')
+        .range(randomOffset, randomOffset);
+
+      if (data && data[0] && !recentSpotlights.has(data[0].message_id)) {
+        movie = data[0];
+        break;
+      }
+    }
+    if (!movie) return;
+
+    recentSpotlights.add(movie.message_id);
+    if (recentSpotlights.size > 25) recentSpotlights.clear();
+
+    await clearPreviousAnnouncement();
+
+    const botUsername = bot.botInfo?.username || (await bot.telegram.getMe()).username;
+    const movieLink = `https://t.me/${botUsername}?start=file_${movie.message_id}`;
+
+    const text =
+      `🎬 <b>Featured Movie of the Day</b>\n\n` +
+      `<b>${escapeHTML(movie.file_name)}</b>\n` +
+      `📦 <b>Size:</b> ${escapeHTML(movie.file_size || 'HD')}  •  <b>Quality:</b> ${escapeHTML(movie.quality || 'HD')}\n\n` +
+      `Available now in our official channel! You can also type any movie name right here in the group to get instant files.\n\n` +
+      `<i>⏳ This spotlight auto-updates with a new movie every few hours.</i>`;
+
+    const sent = await bot.telegram.sendMessage(TARGET_GROUP_ID, text, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.url('🎬 ɢᴇᴛ ᴍᴏᴠɪᴇ', movieLink),
+          Markup.button.url('📢 ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ', activeGroupLink)
+        ]
+      ])
+    });
+
+    lastAnnounceMsgId = sent.message_id;
+    await saveSetting('last_announce_msg_id', lastAnnounceMsgId);
+  } catch (e) {
+    console.error('Spotlight error:', e.message);
+  }
+}
+
+// Schedule 5 times/day (~every 4.8 hours)
+setInterval(postDailySpotlight, 4.8 * 60 * 60 * 1000);
+
 // ================= OWNER & ADMIN PRIVATE DM COMMANDS =================
 bot.command('admin', (ctx) => {
   if (!isOwnerDM(ctx)) return;
@@ -566,16 +675,128 @@ bot.command('admin', (ctx) => {
   });
 });
 
+bot.command('setdeltime', async (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  const mins = parseInt(ctx.message.text.replace('/setdeltime', '').trim(), 10);
+
+  if (isNaN(mins) || mins < 0 || mins > 1440) {
+    return ctx.reply(
+      `❌ Usage: <code>/setdeltime 5</code> (in minutes, <code>0</code> = OFF)\n\n⏱️ Current Auto-Delete: <b>${fileDeleteMinutes === 0 ? 'OFF' : `${fileDeleteMinutes} min(s)`}</b>`,
+      { parse_mode: 'HTML' }
+    );
+  }
+
+  fileDeleteMinutes = mins;
+  await saveSetting('delete_time_mins', mins);
+
+  ctx.reply(
+    mins === 0
+      ? '✅ File Auto-Delete: <b>OFF</b> (Files will not be deleted)'
+      : `✅ File Auto-Delete Timer updated to <b>${mins} minute(s)</b>!`,
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.command('toggleannounce', async (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  autoAnnounceEnabled = !autoAnnounceEnabled;
+  await saveSetting('auto_announce', autoAnnounceEnabled);
+  ctx.reply(`✅ Daily Auto-Movie Spotlights (5/day): <b>${autoAnnounceEnabled ? '🟢 ON' : '🔴 OFF'}</b>`, { parse_mode: 'HTML' });
+});
+
+bot.command('spotlightnow', async (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  if (!TARGET_GROUP_ID) return ctx.reply('❌ GROUP_ID is not set in environment variables.');
+  await postDailySpotlight();
+  ctx.reply('✅ Movie spotlight posted to official group!');
+});
+
+bot.command('announce', async (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  if (!TARGET_GROUP_ID) return ctx.reply('❌ GROUP_ID is not set in environment variables.');
+
+  const customText = ctx.message.text.replace('/announce', '').trim();
+  const replyMsg = ctx.message.reply_to_message;
+
+  if (!customText && !replyMsg) {
+    return ctx.reply('❌ Usage: <code>/announce Your message here</code>\nOr reply to any photo/message with <code>/announce</code>.', { parse_mode: 'HTML' });
+  }
+
+  await clearPreviousAnnouncement();
+
+  try {
+    let sent;
+    if (replyMsg) {
+      sent = await ctx.telegram.copyMessage(TARGET_GROUP_ID, ctx.chat.id, replyMsg.message_id, {
+        ...Markup.inlineKeyboard([[Markup.button.url('📢 ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ', activeGroupLink)]])
+      });
+    } else {
+      sent = await ctx.telegram.sendMessage(
+        TARGET_GROUP_ID,
+        `📢 <b>Announcement</b>\n\n${escapeHTML(customText)}`,
+        {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          ...Markup.inlineKeyboard([[Markup.button.url('📢 ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ', activeGroupLink)]])
+        }
+      );
+    }
+
+    lastAnnounceMsgId = sent.message_id;
+    await saveSetting('last_announce_msg_id', lastAnnounceMsgId);
+    ctx.reply('✅ Custom announcement posted to official group! (Previous announcement cleared)');
+  } catch (e) {
+    ctx.reply(`❌ Failed to announce: <code>${escapeHTML(e.message)}</code>`, { parse_mode: 'HTML' });
+  }
+});
+
+bot.command('broadcast', async (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  const textMsg = ctx.message.text.replace('/broadcast', '').trim();
+  const replyMsg = ctx.message.reply_to_message;
+
+  if (!textMsg && !replyMsg) {
+    return ctx.reply('❌ Usage: <code>/broadcast Your message</code>\nOr reply to any photo/post with <code>/broadcast</code>.', { parse_mode: 'HTML' });
+  }
+
+  const { data: users, error } = await supabase.from('bot_users').select('user_id');
+  if (error || !users || users.length === 0) {
+    return ctx.reply('❌ No users found in database yet.');
+  }
+
+  const statusMsg = await ctx.reply(`🚀 Broadcasting to <b>${users.length}</b> users...`, { parse_mode: 'HTML' });
+  let sent = 0, blocked = 0, failed = 0;
+
+  for (const u of users) {
+    try {
+      if (replyMsg) {
+        await ctx.telegram.copyMessage(u.user_id, ctx.chat.id, replyMsg.message_id);
+      } else {
+        await ctx.telegram.sendMessage(u.user_id, textMsg, { parse_mode: 'HTML', disable_web_page_preview: true });
+      }
+      sent++;
+    } catch (e) {
+      if (e.code === 403) blocked++;
+      else failed++;
+    }
+    await sleep(60);
+  }
+
+  await ctx.telegram
+    .editMessageText(
+      ctx.chat.id,
+      statusMsg.message_id,
+      null,
+      `✅ <b>Broadcast Completed!</b>\n\n📤 Sent: <b>${sent}</b>\n🚫 Blocked: <b>${blocked}</b>\n⚠️ Failed: <b>${failed}</b>`,
+      { parse_mode: 'HTML' }
+    )
+    .catch(() => {});
+});
+
 bot.command('toggleautopost', async (ctx) => {
   if (!isOwnerDM(ctx)) return;
   realtimeAutoPostEnabled = !realtimeAutoPostEnabled;
-  const valStr = realtimeAutoPostEnabled ? 'true' : 'false';
-
-  try {
-    await supabase
-      .from('bot_settings')
-      .upsert({ setting_key: 'realtime_autopost', setting_value: valStr }, { onConflict: 'setting_key' });
-  } catch (e) {}
+  await saveSetting('realtime_autopost', realtimeAutoPostEnabled);
 
   const msg = realtimeAutoPostEnabled
     ? '🟢 <b>DB Live Channel Update: ON</b>\n\nIppudu DB channel lo kotha file padagane category channels ki live update velthundi.'
@@ -595,18 +816,7 @@ bot.command('setlink', async (ctx) => {
   }
 
   activeGroupLink = newLink;
-  try {
-    const { error } = await supabase
-      .from('bot_settings')
-      .upsert({ setting_key: 'group_link', setting_value: newLink }, { onConflict: 'setting_key' });
-
-    if (error) {
-      return ctx.reply(
-        `✅ Link updated live to <code>${escapeHTML(newLink)}</code>!\n⚠️ <i>(DB note: <code>${escapeHTML(error.message)}</code>)</i>`,
-        { parse_mode: 'HTML' }
-      );
-    }
-  } catch (e) {}
+  await saveSetting('group_link', newLink);
 
   ctx.reply(`✅ Group link updated! Ippudu nunchi files caption lo ee link vasthundi:\n<code>${escapeHTML(newLink)}</code>`, {
     parse_mode: 'HTML'
@@ -617,15 +827,26 @@ bot.command('stats', async (ctx) => {
   const allowed = await isAdmin(ctx);
   if (!allowed) return;
 
-  const { data, count, error } = await supabase
+  const { count: movieCount, error } = await supabase
     .from('movies_index')
-    .select('*', { count: 'exact' });
+    .select('*', { count: 'exact', head: true });
+  const { count: userCount } = await supabase
+    .from('bot_users')
+    .select('*', { count: 'exact', head: true });
 
   if (error) {
     return ctx.reply(`❌ DB Error: <code>${escapeHTML(error.message)}</code>`, { parse_mode: 'HTML' });
   }
   ctx.reply(
-    `📊 <b>JJ AI BOT STATS</b>\n\n🎬 <b>Total Indexed Files:</b> <code>${count ?? data?.length ?? 0}</code>\n⚡ <b>DB Live Update:</b> <code>${realtimeAutoPostEnabled ? 'ON' : 'OFF'}</code>\n🗄️ <b>Extra DBs:</b> <code>${extraDbs.length}</code>\n👮 <b>Extra Admins:</b> <code>${extraAdmins.length}</code>\n🟢 <b>Status:</b> Online & Ready`,
+    `📊 <b>JJ AI BOT STATS</b>\n\n` +
+    `🎬 <b>Total Indexed Files:</b> <code>${movieCount ?? 0}</code>\n` +
+    `👥 <b>Total Bot Users:</b> <code>${userCount ?? 0}</code>\n` +
+    `⏱️ <b>File Auto-Delete:</b> <code>${fileDeleteMinutes === 0 ? 'OFF' : `${fileDeleteMinutes}m`}</code>\n` +
+    `📢 <b>Daily Spotlights:</b> <code>${autoAnnounceEnabled ? 'ON' : 'OFF'}</code>\n` +
+    `⚡ <b>DB Live Update:</b> <code>${realtimeAutoPostEnabled ? 'ON' : 'OFF'}</code>\n` +
+    `🗄️ <b>Extra DBs:</b> <code>${extraDbs.length}</code>\n` +
+    `👮 <b>Extra Admins:</b> <code>${extraAdmins.length}</code>\n` +
+    `🟢 <b>Status:</b> Online & Ready`,
     { parse_mode: 'HTML' }
   );
 });
@@ -1188,7 +1409,7 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-// ================= FILE DELIVERY (SINGLE, SEND ALL & BATCH) =================
+// ================= FILE DELIVERY (SINGLE, SEND ALL & BATCH) + DYNAMIC AUTO-DELETE =================
 async function deliverFiles(ctx, items, labelName) {
   const sentIds = [];
   let lastTitle = 'Movie';
@@ -1230,8 +1451,12 @@ async function deliverFiles(ctx, items, labelName) {
   const shareText = await getUniqueShareMsg(labelName, lastTitle);
   const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(activeGroupLink)}&text=${encodeURIComponent('🎬 Free HD Movies Group mawa! Join avvu:')}`;
 
+  const noteLine = fileDeleteMinutes > 0
+    ? `\n\n⚠️ <b>Note:</b> Ee file(s) <b>${fileDeleteMinutes} minute(s)</b> lo auto-delete avuthayi. Ventane Saved Messages ki forward chesko!`
+    : '';
+
   const warnMsg = await ctx.reply(
-    `${shareText}\n\n⚠️ <b>Note:</b> Ee file(s) <b>5 minutes</b> lo auto-delete avuthayi. Ventane Saved Messages ki forward chesko!`,
+    `${shareText}${noteLine}`,
     {
       parse_mode: 'HTML',
       reply_to_message_id: sentIds[sentIds.length - 1],
@@ -1239,27 +1464,30 @@ async function deliverFiles(ctx, items, labelName) {
     }
   );
 
-  setTimeout(async () => {
-    for (const id of sentIds) {
-      await ctx.telegram.deleteMessage(ctx.chat.id, id).catch(() => {});
-    }
-    await ctx.telegram.editMessageText(
-      ctx.chat.id, warnMsg.message_id, null,
-      '✅ <b>YOUR FILES HAVE BEEN DELETED!</b>\nKindly search again in the group.',
-      {
-        parse_mode: 'HTML',
-        ...Markup.inlineKeyboard([[Markup.button.url('📤 Share Group with Friends', shareUrl)]])
+  if (fileDeleteMinutes > 0) {
+    setTimeout(async () => {
+      for (const id of sentIds) {
+        await ctx.telegram.deleteMessage(ctx.chat.id, id).catch(() => {});
       }
-    ).catch(() => {});
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, warnMsg.message_id, null,
+        '✅ <b>YOUR FILES HAVE BEEN DELETED!</b>\nKindly search again in the group.',
+        {
+          parse_mode: 'HTML',
+          ...Markup.inlineKeyboard([[Markup.button.url('📤 Share Group with Friends', shareUrl)]])
+        }
+      ).catch(() => {});
 
-    setTimeout(() => {
-      ctx.telegram.deleteMessage(ctx.chat.id, warnMsg.message_id).catch(() => {});
-    }, 30 * 1000);
-  }, 5 * 60 * 1000);
+      setTimeout(() => {
+        ctx.telegram.deleteMessage(ctx.chat.id, warnMsg.message_id).catch(() => {});
+      }, 30 * 1000);
+    }, fileDeleteMinutes * 60 * 1000);
+  }
 }
 
 // ================= DEEP LINK DELIVERY (/start) =================
 bot.start(async (ctx) => {
+  await registerUser(ctx.from);
   const payload = ctx.startPayload;
   const labelName = getRequesterDisplay(ctx);
 
@@ -1362,9 +1590,9 @@ bot.on('message', async (ctx, next) => {
   return next();
 });
 
-// ================= GROUP SEARCH & FILTERS =================
-async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', botUsername, tagLabel = 'JJ Movies AI') {
-  const limit = 6;
+// ================= STYLISH COMPACT GROUP SEARCH UI =================
+async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', botUsername, season = 'ALL', startTime = Date.now()) {
+  const limit = 10;
   let dbQuery = supabase
     .from('movies_index')
     .select('*', { count: 'exact' })
@@ -1372,6 +1600,7 @@ async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', b
 
   if (qual !== 'ALL') dbQuery = dbQuery.ilike('quality', `%${qual}%`);
   if (lang !== 'ALL') dbQuery = dbQuery.ilike('language', `%${lang}%`);
+  if (season !== 'ALL') dbQuery = dbQuery.ilike('file_name', `%${season}%`);
 
   const { data, count, error } = await dbQuery
     .order('created_at', { ascending: false })
@@ -1380,10 +1609,10 @@ async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', b
   if (error || !data || data.length === 0) return null;
 
   const totalPages = Math.ceil(count / limit);
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
 
-  let text = `🎬 <b>${escapeHTML(query)}</b> • <code>${count} Files</code>\n`;
-  text += `⚡ <a href="${activeGroupLink}">${escapeHTML(tagLabel)}</a>\n`;
-  text += `──────────────\n\n`;
+  let text = `✦ ʀᴇꜱᴜʟᴛ ɪɴ : <b>${elapsed} ꜱᴇᴄᴏɴᴅꜱ</b>\n`;
+  text += `⚡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ : <a href="${activeGroupLink}"><b>ᴊᴊ ᴍᴏᴠɪᴇꜱ</b></a>\n\n`;
 
   const batchIds = data.slice(0, 5).map(i => i.message_id).join('_');
   const sendAllUrl = `https://t.me/${botUsername}?start=all_${batchIds}`;
@@ -1391,38 +1620,36 @@ async function buildSearchMessage(query, page = 0, qual = 'ALL', lang = 'ALL', b
   data.forEach((item, idx) => {
     const num = page * limit + idx + 1;
     const link = `https://t.me/${botUsername}?start=file_${item.message_id}`;
-    const meta = detectMeta(item.file_name);
-    text += `<b>${num}.</b> <a href="${link}">${escapeHTML(item.file_name)}</a>\n`;
-    text += `📦 <code>${escapeHTML(item.file_size)}</code> | <code>${escapeHTML(item.quality || meta.quality)}</code> | <code>${escapeHTML(item.language || meta.language)}</code>\n\n`;
+    const sizeLabel = item.file_size || 'HD';
+    text += `<b>${num}.</b> <a href="${link}"><b>[${escapeHTML(sizeLabel)}]</b> ${escapeHTML(item.file_name)}</a>\n\n`;
   });
 
-  text += `──────────────\n`;
-  text += `👇 <i>Click a file to get it in DM</i>`;
-
-  const qShort = query.slice(0, 18);
+  const qShort = query.slice(0, 15);
   const buttons = [
-    [Markup.button.url(`⚡ SEND ALL (${Math.min(data.length, 5)} FILES)`, sendAllUrl)],
     [
-      Markup.button.callback(qual === '480p' ? '✅ 480p' : '480p', `f|${qShort}|0|480p|${lang}`),
-      Markup.button.callback(qual === '720p' ? '✅ 720p' : '720p', `f|${qShort}|0|720p|${lang}`),
-      Markup.button.callback(qual === '1080p' ? '✅ 1080p' : '1080p', `f|${qShort}|0|1080p|${lang}`),
-      Markup.button.callback(qual === 'ALL' ? '✅ ALL' : 'ALL', `f|${qShort}|0|ALL|${lang}`)
+      Markup.button.url('ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ', activeGroupLink),
+      Markup.button.url('ꜱᴇɴᴅ ᴀʟʟ', sendAllUrl)
     ],
     [
-      Markup.button.callback(lang === 'Telugu' ? '✅ Tel' : 'Telugu', `f|${qShort}|0|${qual}|Telugu`),
-      Markup.button.callback(lang === 'Hindi' ? '✅ Hin' : 'Hindi', `f|${qShort}|0|${qual}|Hindi`),
-      Markup.button.callback(lang === 'Tamil' ? '✅ Tam' : 'Tamil', `f|${qShort}|0|${qual}|Tamil`),
-      Markup.button.callback(lang === 'ALL' ? '✅ All Lang' : 'All Lang', `f|${qShort}|0|${qual}|ALL`)
+      Markup.button.callback(qual === 'ALL' ? 'Qᴜᴀʟɪᴛʏ' : `✓ ${qual}`, `m|q|${qShort}|${qual}|${lang}|${season}`),
+      Markup.button.callback(lang === 'ALL' ? 'ʟᴀɴɢᴜᴀɢᴇ' : `✓ ${lang.slice(0, 3)}`, `m|l|${qShort}|${qual}|${lang}|${season}`),
+      Markup.button.callback(season === 'ALL' ? 'ꜱᴇᴀꜱᴏɴ' : `✓ ${season}`, `m|s|${qShort}|${qual}|${lang}|${season}`)
     ]
   ];
 
   const navRow = [];
-  if (page > 0) navRow.push(Markup.button.callback('⬅️ PREV', `f|${qShort}|${page - 1}|${qual}|${lang}`));
-  navRow.push(Markup.button.callback(`📄 ${page + 1}/${totalPages}`, 'noop'));
-  if (page + 1 < totalPages) navRow.push(Markup.button.callback('NEXT ➡️', `f|${qShort}|${page + 1}|${qual}|${lang}`));
+  if (page > 0) {
+    navRow.push(Markup.button.callback('⋖ ᴘʀᴇᴠ', `f|${qShort}|${page - 1}|${qual}|${lang}|${season}`));
+  } else {
+    navRow.push(Markup.button.callback('ᴘᴀɢᴇ', 'noop'));
+  }
+  navRow.push(Markup.button.callback(`${page + 1}/${totalPages}`, 'noop'));
+  if (page + 1 < totalPages) {
+    navRow.push(Markup.button.callback('ɴᴇxᴛ ⋗', `f|${qShort}|${page + 1}|${qual}|${lang}|${season}`));
+  }
   buttons.push(navRow);
 
-  return { text, keyboard: Markup.inlineKeyboard(buttons) };
+  return { text: text.trim(), keyboard: Markup.inlineKeyboard(buttons) };
 }
 
 bot.on('text', async (ctx) => {
@@ -1438,6 +1665,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
+  const startTime = Date.now();
   let searchKeyword = userText;
   try {
     const prompt = `Analyze this Telegram group message: "${userText}"
@@ -1454,9 +1682,9 @@ Is the user asking for a movie, web series, or anime?
     if (aiOut && aiOut.length < 50) searchKeyword = aiOut;
   } catch (e) {}
 
-  let res = await buildSearchMessage(searchKeyword, 0, 'ALL', 'ALL', ctx.botInfo.username, 'JJ Movies AI');
+  let res = await buildSearchMessage(searchKeyword, 0, 'ALL', 'ALL', ctx.botInfo.username, 'ALL', startTime);
   if (!res && searchKeyword.toLowerCase() !== userText.toLowerCase()) {
-    res = await buildSearchMessage(userText, 0, 'ALL', 'ALL', ctx.botInfo.username, 'JJ Movies AI');
+    res = await buildSearchMessage(userText, 0, 'ALL', 'ALL', ctx.botInfo.username, 'ALL', startTime);
   }
 
   if (!res) {
@@ -1586,9 +1814,54 @@ bot.action(/^addch_(.+)$/, async (ctx) => {
   ).catch(() => {});
 });
 
-bot.action(/^f\|(.+)\|(\d+)\|(.+)\|(.+)$/, async (ctx) => {
-  const [, query, pageStr, qual, lang] = ctx.match;
-  const res = await buildSearchMessage(query, parseInt(pageStr, 10), qual, lang, ctx.botInfo.username, 'JJ Movies AI');
+// Filter Sub-Menus (Quality / Language / Season)
+bot.action(/^m\|(q|l|s)\|(.+)\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
+  const [, type, qShort, qual, lang, season] = ctx.match;
+  let rows = [];
+
+  if (type === 'q') {
+    rows = [
+      [
+        Markup.button.callback(qual === '480p' ? '✅ 480ᴘ' : '480ᴘ', `f|${qShort}|0|480p|${lang}|${season}`),
+        Markup.button.callback(qual === '720p' ? '✅ 720ᴘ' : '720ᴘ', `f|${qShort}|0|720p|${lang}|${season}`)
+      ],
+      [
+        Markup.button.callback(qual === '1080p' ? '✅ 1080ᴘ' : '1080ᴘ', `f|${qShort}|0|1080p|${lang}|${season}`),
+        Markup.button.callback(qual === 'ALL' ? '✅ ᴀʟʟ' : 'ᴀʟʟ', `f|${qShort}|0|ALL|${lang}|${season}`)
+      ]
+    ];
+  } else if (type === 'l') {
+    rows = [
+      [
+        Markup.button.callback(lang === 'Telugu' ? '✅ ᴛᴇʟᴜɢᴜ' : 'ᴛᴇʟᴜɢᴜ', `f|${qShort}|0|${qual}|Telugu|${season}`),
+        Markup.button.callback(lang === 'Hindi' ? '✅ ʜɪɴᴅɪ' : 'ʜɪɴᴅɪ', `f|${qShort}|0|${qual}|Hindi|${season}`)
+      ],
+      [
+        Markup.button.callback(lang === 'Tamil' ? '✅ ᴛᴀᴍɪʟ' : 'ᴛᴀᴍɪʟ', `f|${qShort}|0|${qual}|Tamil|${season}`),
+        Markup.button.callback(lang === 'English' ? '✅ ᴇɴɢʟɪꜱʜ' : 'ᴇɴɢʟɪꜱʜ', `f|${qShort}|0|${qual}|English|${season}`)
+      ],
+      [Markup.button.callback(lang === 'ALL' ? '✅ ᴀʟʟ ʟᴀɴɢᴜᴀɢᴇꜱ' : 'ᴀʟʟ ʟᴀɴɢᴜᴀɢᴇꜱ', `f|${qShort}|0|${qual}|ALL|${season}`)]
+    ];
+  } else if (type === 's') {
+    rows = [
+      [
+        Markup.button.callback(season === 'S01' ? '✅ ꜱ01' : 'ꜱ01', `f|${qShort}|0|${qual}|${lang}|S01`),
+        Markup.button.callback(season === 'S02' ? '✅ ꜱ02' : 'ꜱ02', `f|${qShort}|0|${qual}|${lang}|S02`),
+        Markup.button.callback(season === 'S03' ? '✅ ꜱ03' : 'ꜱ03', `f|${qShort}|0|${qual}|${lang}|S03`)
+      ],
+      [Markup.button.callback(season === 'ALL' ? '✅ ᴀʟʟ ꜱᴇᴀꜱᴏɴꜱ' : 'ᴀʟʟ ꜱᴇᴀꜱᴏɴꜱ', `f|${qShort}|0|${qual}|${lang}|ALL`)]
+    ];
+  }
+
+  rows.push([Markup.button.callback('⋖ ʙᴀᴄᴋ', `f|${qShort}|0|${qual}|${lang}|${season}`)]);
+  await ctx.editMessageReplyMarkup(Markup.inlineKeyboard(rows).reply_markup).catch(() => {});
+  ctx.answerCbQuery();
+});
+
+// Pagination & Filter Apply
+bot.action(/^f\|(.+)\|(\d+)\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
+  const [, query, pageStr, qual, lang, season] = ctx.match;
+  const res = await buildSearchMessage(query, parseInt(pageStr, 10), qual, lang, ctx.botInfo.username, season);
   if (!res) return ctx.answerCbQuery('❌ Ee filter lo files levu!', { show_alert: true });
 
   await ctx.editMessageText(res.text, {
@@ -1627,6 +1900,11 @@ if (ADMIN_ID) {
     [
       { command: 'start', description: '👑 Admin Panel' },
       { command: 'admin', description: '📋 Admin Commands' },
+      { command: 'setdeltime', description: '⏱️ Set File Auto-Delete Timer' },
+      { command: 'announce', description: '📢 Custom Group Announcement' },
+      { command: 'spotlightnow', description: '🎬 Post Movie Spotlight Now' },
+      { command: 'toggleannounce', description: '🔄 ON/OFF Daily 5 Spotlights' },
+      { command: 'broadcast', description: '📣 DM Broadcast to All Users' },
       { command: 'toggleautopost', description: '⚡ ON/OFF DB Live Channel Update' },
       { command: 'autopost', description: '🚀 Post Remaining (Year-Wise)' },
       { command: 'stopautopost', description: '🛑 Stop Running Auto-Post' },
