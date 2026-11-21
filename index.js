@@ -1,4 +1,4 @@
-const { Telegraf, Markup } = require('telegraf');
+ const { Telegraf, Markup } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const express = require('express');
@@ -54,8 +54,11 @@ const pendingAutoPosts = new Map();
 let isAutoPosting = false;
 let stopAutoPostFlag = false;
 
-// Supabase Limit / Storage Early Warning Config
-const DB_WARN_THRESHOLD = 40000;
+// 80% Limit / Storage Early Warning Config
+const DB_MAX_ROWS = 50000;
+const DB_WARN_THRESHOLD = Math.floor(DB_MAX_ROWS * 0.8); // 40,000 (80%)
+const DB_MAX_MB = 500;
+const DB_WARN_MB = Math.floor(DB_MAX_MB * 0.8); // 400 MB (80%)
 let lastDbQuotaAlertAt = 0;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -137,7 +140,7 @@ async function loadDynamicConfig() {
 }
 loadDynamicConfig();
 
-// Early Warning Alert for Supabase Limit / Storage
+// Early Warning Alert for Supabase Limit / Storage (80% Threshold)
 async function notifyOwnerDbAlert(reasonText) {
   const now = Date.now();
   if (now - lastDbQuotaAlertAt < 24 * 60 * 60 * 1000) return;
@@ -145,7 +148,7 @@ async function notifyOwnerDbAlert(reasonText) {
 
   const recipients = [ADMIN_ID, ...extraAdmins].filter(Boolean);
   const msg =
-    `🚨 <b>SUPABASE LIMIT / STORAGE ALERT</b>\n\n` +
+    `🚨 <b>SUPABASE 80% STORAGE / LIMIT ALERT</b>\n\n` +
     `${reasonText}\n\n` +
     `👉 <i>Supabase lo limit/storage full avvakunda munde kotha Supabase ID (project) create cheskondi, tarvata <code>/adddb</code> tho bot lo add cheyandi!</i>`;
 
@@ -156,9 +159,29 @@ async function notifyOwnerDbAlert(reasonText) {
 
 async function checkSupabaseThreshold(client = supabase) {
   try {
-    const { count } = await client.from('movies_index').select('*', { count: 'exact', head: true });
-    if (typeof count === 'number' && count >= DB_WARN_THRESHOLD) {
-      await notifyOwnerDbAlert(`📊 <b>Current Indexed Rows:</b> <code>${count}</code> / <code>${DB_WARN_THRESHOLD}</code>`);
+    const { data, count } = await client
+      .from('movies_index')
+      .select('file_size', { count: 'exact' })
+      .limit(5000);
+
+    let approxMb = 0;
+    for (const row of data || []) {
+      const s = String(row.file_size || '');
+      const num = parseFloat(s);
+      if (!isNaN(num)) {
+        approxMb += /gb/i.test(s) ? num * 1024 : num;
+      }
+    }
+
+    const rowPct = typeof count === 'number' ? Math.round((count / DB_MAX_ROWS) * 100) : 0;
+    const sizePct = Math.round((approxMb / DB_MAX_MB) * 100);
+
+    if ((typeof count === 'number' && count >= DB_WARN_THRESHOLD) || approxMb >= DB_WARN_MB) {
+      await notifyOwnerDbAlert(
+        `📊 <b>Usage Reached ~${Math.max(rowPct, sizePct)}% (80% Threshold)</b>\n` +
+        `• Rows: <code>${count ?? 0}</code> / <code>${DB_MAX_ROWS}</code>\n` +
+        `• Indexed Size Sum: <code>${approxMb.toFixed(0)} MB</code> / <code>${DB_MAX_MB} MB</code>`
+      );
     }
   } catch (e) {}
 }
@@ -387,7 +410,6 @@ async function fetchTmdbInfo(title, year, isSeries) {
 
     let first = await searchTmdb(title, year);
 
-    // 1. TMDB lo dorakakapothe -> Gemini tho exact official title theeskuni malli try chey
     let correctedTitle = title;
     if (!first) {
       try {
@@ -436,7 +458,6 @@ async function fetchTmdbInfo(title, year, isSeries) {
       posterUrl = bannerPath ? `https://image.tmdb.org/t/p/w780${bannerPath}` : null;
     }
 
-    // 2. TMDB lo image lekapothe -> Wikipedia nunchi direct photo fetch chey
     if (!posterUrl) {
       posterUrl = await fetchWikipediaPoster(finalTitle, finalYear);
     }
@@ -516,7 +537,7 @@ function getAdminPanelText() {
     `• /clearposts - 1-Click Clear Category Channel\n` +
     `• /resetbatches - Reset Posted History\n` +
     `• /adddb - Add Extra Supabase DB\n` +
-    `• /listdb - View Active DBs\n` +
+    `• /listdb - View Active DBs & Storage (%)\n` +
     `• /addadmin - Add Bot Admin (Owner)\n` +
     `• /deladmin - Remove Bot Admin (Owner)\n` +
     `• /admins - View Admins List\n` +
@@ -708,10 +729,53 @@ bot.command('adddb', (ctx) => {
   ctx.reply('🗄️ Kotha Supabase details ila pampandi:\n\n<code>SUPABASE_URL SUPABASE_ANON_KEY</code>', { parse_mode: 'HTML' });
 });
 
-bot.command('listdb', (ctx) => {
+bot.command('listdb', async (ctx) => {
   if (!isOwnerDM(ctx)) return;
-  const list = extraDbs.map((d, i) => `${i + 1}. ${d.url}`).join('\n') || 'No extra DBs added.';
-  ctx.reply(`🗄️ <b>Active Databases:</b>\n\n<b>Main:</b> ${process.env.SUPABASE_URL || 'Default'}\n\n<b>Extra:</b>\n${escapeHTML(list)}`, { parse_mode: 'HTML' });
+
+  const allDbs = [
+    { label: 'Main DB', url: process.env.SUPABASE_URL || 'Default', client: supabase },
+    ...extraDbs.map((d, i) => ({ label: `Extra DB #${i + 1}`, url: d.url, client: d.client }))
+  ];
+
+  let text = `🗄️ <b>ACTIVE DATABASES & STORAGE (%)</b>\n\n`;
+
+  for (const dbItem of allDbs) {
+    try {
+      const { data, count, error } = await dbItem.client
+        .from('movies_index')
+        .select('file_size', { count: 'exact' })
+        .limit(5000);
+
+      if (error) {
+        text += `• <b>${dbItem.label}</b> (${escapeHTML(dbItem.url)})\n   ❌ Error: <code>${escapeHTML(error.message)}</code>\n\n`;
+        continue;
+      }
+
+      let totalMb = 0;
+      for (const r of data || []) {
+        const raw = String(r.file_size || '');
+        const num = parseFloat(raw);
+        if (!isNaN(num)) {
+          totalMb += /gb/i.test(raw) ? num * 1024 : num;
+        }
+      }
+
+      const rowCount = count ?? (data ? data.length : 0);
+      const sizePct = Math.min(100, ((totalMb / DB_MAX_MB) * 100).toFixed(1));
+      const rowPct = Math.min(100, ((rowCount / DB_MAX_ROWS) * 100).toFixed(1));
+      const maxPct = Math.max(parseFloat(sizePct), parseFloat(rowPct));
+      const statusEmoji = maxPct >= 80 ? '🚨' : maxPct >= 50 ? '⚠️' : '🟢';
+
+      text +=
+        `${statusEmoji} <b>${dbItem.label}</b>\n` +
+        `   🔗 <code>${escapeHTML(dbItem.url)}</code>\n` +
+        `   📊 <b>Storage:</b> <code>${sizePct}%</code> (${totalMb.toFixed(0)}/${DB_MAX_MB} MB) | <b>Rows:</b> <code>${rowPct}%</code> (${rowCount}/${DB_MAX_ROWS})\n\n`;
+    } catch (e) {
+      text += `• <b>${dbItem.label}:</b> ❌ Failed to fetch usage\n\n`;
+    }
+  }
+
+  ctx.reply(text.trim(), { parse_mode: 'HTML' });
 });
 
 // ================= EASY 1-CLICK CLEAR CATEGORY CHANNELS (EXCLUDES STORAGE DB) =================
@@ -782,7 +846,6 @@ bot.command('autopost', async (ctx) => {
   stopAutoPostFlag = false;
   await ctx.reply('🔄 Scanning Supabase DBs & skipping already posted batches (Remaining unposted movies year-wise post avuthayi)...');
 
-  // Run in background so /stopautopost responds instantly & no 90s timeout
   (async () => {
     try {
       let allFiles = [];
@@ -826,7 +889,6 @@ bot.command('autopost', async (ctx) => {
         (existing || []).filter((e) => e.posted === true).map((e) => e.movie_key)
       );
 
-      // Skip already posted & Sort Ascending by Year (Oldest first, Newest at bottom)
       const pendingEntries = Array.from(groups.entries())
         .filter(([key]) => {
           if (postedKeys.has(key)) return false;
@@ -861,7 +923,7 @@ bot.command('autopost', async (ctx) => {
 
           const targetType = resolveCategory(g.meta, tmdb, langsArr);
           const targetChannels = channels[targetType] || [];
-          if (targetChannels.length === 0) continue; // Strict: do NOT post to another category
+          if (targetChannels.length === 0) continue;
 
           const isTheatre = g.meta.isTheatreFile;
           const finalMovieKey = isTheatre ? `${movieKey}_v1` : movieKey;
@@ -902,7 +964,6 @@ bot.command('autopost', async (ctx) => {
               await sendBannerPhoto(targetCh, tmdb?.posterUrl, caption);
               postedCount++;
 
-              // Anti-Ban Safe Delay: 3.5s per post + 15s cooldown every 15 posts
               await sleep(3500);
               if (postedCount % 15 === 0) {
                 console.log(`🧊 Anti-Ban Cooldown: 15s rest after ${postedCount} posts...`);
@@ -943,7 +1004,6 @@ async function processRealtimeBatch(movieKey) {
     let versionTag = '';
 
     if (isTheatre) {
-      // ONLY for Theatre Prints: Auto-detect V1, V2, V3...
       const { data: prevVersions } = await supabase
         .from('movie_batches')
         .select('movie_key')
@@ -953,7 +1013,6 @@ async function processRealtimeBatch(movieKey) {
       finalMovieKey = `${movieKey}_v${versionNum}`;
       versionTag = ` [V${versionNum}]`;
     } else {
-      // Normal HD Movies: No duplicate reposts, merge into existing batch
       const { data: existing } = await supabase
         .from('movie_batches')
         .select('*')
@@ -983,17 +1042,14 @@ async function processRealtimeBatch(movieKey) {
       }
     }
 
-    // Put Sample Video first in the batch if present
     const sortedItems = [...items].sort((a, b) => (b.isSample ? 1 : 0) - (a.isSample ? 1 : 0));
     const hasSample = sortedItems.some((it) => it.isSample);
 
-    // Fetch TMDB 16:9 Banner (with Gemini + Wikipedia fallback)
     const tmdb = await fetchTmdbInfo(meta.title, meta.year, meta.isSeries);
     const finalTitle = tmdb?.title || meta.title;
     const finalYear = tmdb?.year || meta.year || 'N/A';
     const langsArr = Array.from(langs);
 
-    // Strict Category Routing
     const targetType = resolveCategory(meta, tmdb, langsArr);
     const targetChannels = channels[targetType] || [];
     if (targetChannels.length === 0) {
@@ -1072,7 +1128,6 @@ function scheduleRealtimeAutoPost(record) {
     isSample: meta.isSample
   });
 
-  // 15 seconds debounce so multiple qualities + Sample Video combine into 1 post
   entry.timer = setTimeout(() => processRealtimeBatch(meta.groupKey), 15000);
 }
 
@@ -1102,7 +1157,7 @@ bot.on('channel_post', async (ctx) => {
   const { error } = await supabase.from('movies_index').upsert(record, { onConflict: 'message_id' });
   if (error) {
     const errMsg = String(error.message || '').toLowerCase();
-    if (/quota|storage|limit|space|full|exceeded/i.test(errMsg)) {
+    if (/quota|storage|limit|space|full|exceeded|size|disk/i.test(errMsg)) {
       await notifyOwnerDbAlert(`❌ <b>DB Error:</b> <code>${escapeHTML(error.message)}</code>`);
     }
     if (extraDbs.length > 0) {
@@ -1598,7 +1653,7 @@ if (ADMIN_ID) {
       { command: 'clearposts', description: '🧹 1-Click Clear Category Channel' },
       { command: 'resetbatches', description: '🔄 Reset Posted History' },
       { command: 'adddb', description: '🗄️ Add Extra Supabase DB' },
-      { command: 'listdb', description: '📚 View Active DBs' },
+      { command: 'listdb', description: '📚 View Active DBs & Storage (%)' },
       { command: 'addadmin', description: '👮 Add Bot Admin (Owner)' },
       { command: 'deladmin', description: '❌ Remove Bot Admin (Owner)' },
       { command: 'admins', description: '👥 View Admins List' },
