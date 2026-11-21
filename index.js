@@ -46,6 +46,7 @@ let channels = {
   telugu: []   // Telugu & Remaining
 };
 let activeGroupLink = GROUP_LINK;
+let realtimeAutoPostEnabled = false; // Default OFF: nuvvu ON chesthene DB files live update avuthayi
 const adminState = new Map();
 const pendingAutoPosts = new Map();
 
@@ -120,11 +121,16 @@ async function loadDynamicConfig() {
       const { data: settings } = await supabase.from('bot_settings').select('setting_key, setting_value');
       const linkRow = (settings || []).find((s) => s.setting_key === 'group_link');
       activeGroupLink = (linkRow?.setting_value || GROUP_LINK).trim();
+
+      const autoPostRow = (settings || []).find((s) => s.setting_key === 'realtime_autopost');
+      if (autoPostRow) {
+        realtimeAutoPostEnabled = autoPostRow.setting_value === 'true';
+      }
     } catch (e) {
       activeGroupLink = GROUP_LINK;
     }
 
-    console.log(`✅ Loaded ${extraDbs.length} extra DBs, ${(chs || []).length} channels, ${extraAdmins.length} extra admins.`);
+    console.log(`✅ Loaded ${extraDbs.length} extra DBs, ${(chs || []).length} channels, ${extraAdmins.length} extra admins. LiveAutoPost=${realtimeAutoPostEnabled}`);
   } catch (err) {
     console.error('Config Load Error:', err.message);
   }
@@ -496,14 +502,17 @@ async function findSpellingOrSimilar(query) {
 }
 
 function getAdminPanelText() {
+  const liveStatus = realtimeAutoPostEnabled ? '🟢 ON' : '🔴 OFF';
   return (
     `👑 <b>JJ FILES ADMIN PANEL</b>\n\n` +
+    `⚡ <b>Live Channel Update:</b> ${liveStatus} (<code>/toggleautopost</code>)\n\n` +
+    `• /toggleautopost - ON/OFF DB Live Channel Updates\n` +
+    `• /autopost - Post Remaining Unposted (Year-Wise)\n` +
+    `• /stopautopost - Stop Running Auto-Post\n` +
+    `• /setlink - Change File Caption Link\n` +
     `• /addchannel - Add Category Channel\n` +
     `• /channels - View Connected Channels\n` +
     `• /delchannel - Remove Channel\n` +
-    `• /setlink - Change File Caption Link\n` +
-    `• /autopost - Safe Year-Wise Auto-Post\n` +
-    `• /stopautopost - Stop Running Auto-Post\n` +
     `• /clearposts - 1-Click Clear Category Channel\n` +
     `• /resetbatches - Reset Posted History\n` +
     `• /adddb - Add Extra Supabase DB\n` +
@@ -541,6 +550,24 @@ bot.command('admin', (ctx) => {
     parse_mode: 'HTML',
     ...Markup.inlineKeyboard([[Markup.button.callback('📢 Add Channel', 'addch_back')]])
   });
+});
+
+bot.command('toggleautopost', async (ctx) => {
+  if (!isOwnerDM(ctx)) return;
+  realtimeAutoPostEnabled = !realtimeAutoPostEnabled;
+  const valStr = realtimeAutoPostEnabled ? 'true' : 'false';
+
+  try {
+    await supabase
+      .from('bot_settings')
+      .upsert({ setting_key: 'realtime_autopost', setting_value: valStr }, { onConflict: 'setting_key' });
+  } catch (e) {}
+
+  const msg = realtimeAutoPostEnabled
+    ? '🟢 <b>DB Live Channel Update: ON</b>\n\nIppudu DB channel lo kotha file padagane category channels ki live update velthundi.'
+    : '🔴 <b>DB Live Channel Update: OFF</b>\n\nIppudu DB lo kotha files index matrame avuthayi, channels ki live update velladu. Kavalsinappudu <code>/toggleautopost</code> tho ON chesko ledha <code>/autopost</code> tho remaining vatini post chesko.';
+
+  ctx.reply(msg, { parse_mode: 'HTML' });
 });
 
 bot.command('setlink', async (ctx) => {
@@ -584,7 +611,7 @@ bot.command('stats', async (ctx) => {
     return ctx.reply(`❌ DB Error: <code>${escapeHTML(error.message)}</code>`, { parse_mode: 'HTML' });
   }
   ctx.reply(
-    `📊 <b>JJ AI BOT STATS</b>\n\n🎬 <b>Total Indexed Files:</b> <code>${count ?? data?.length ?? 0}</code>\n🗄️ <b>Extra DBs:</b> <code>${extraDbs.length}</code>\n👮 <b>Extra Admins:</b> <code>${extraAdmins.length}</code>\n⚡ <b>Status:</b> Online & Ready`,
+    `📊 <b>JJ AI BOT STATS</b>\n\n🎬 <b>Total Indexed Files:</b> <code>${count ?? data?.length ?? 0}</code>\n⚡ <b>DB Live Update:</b> <code>${realtimeAutoPostEnabled ? 'ON' : 'OFF'}</code>\n🗄️ <b>Extra DBs:</b> <code>${extraDbs.length}</code>\n👮 <b>Extra Admins:</b> <code>${extraAdmins.length}</code>\n🟢 <b>Status:</b> Online & Ready`,
     { parse_mode: 'HTML' }
   );
 });
@@ -744,7 +771,7 @@ bot.command('stopautopost', (ctx) => {
   ctx.reply('🛑 Stopping `/autopost` safely after current post...');
 });
 
-// ================= SAFE ANTI-BAN BACKGROUND YEAR-WISE AUTO-POST =================
+// ================= SAFE ANTI-BAN BACKGROUND YEAR-WISE AUTO-POST (REMAINING UNPOSTED ONLY) =================
 bot.command('autopost', async (ctx) => {
   if (!isOwnerDM(ctx)) return;
   if (isAutoPosting) {
@@ -753,7 +780,7 @@ bot.command('autopost', async (ctx) => {
 
   isAutoPosting = true;
   stopAutoPostFlag = false;
-  await ctx.reply('🔄 Scanning Supabase DBs & sorting movies year-wise (Anti-Ban safe speed lo post avuthayi)...');
+  await ctx.reply('🔄 Scanning Supabase DBs & skipping already posted batches (Remaining unposted movies year-wise post avuthayi)...');
 
   // Run in background so /stopautopost responds instantly & no 90s timeout
   (async () => {
@@ -794,10 +821,12 @@ bot.command('autopost', async (ctx) => {
         });
       }
 
-      const { data: existing } = await supabase.from('movie_batches').select('movie_key').eq('posted', true);
-      const postedKeys = new Set((existing || []).map((e) => e.movie_key));
+      const { data: existing } = await supabase.from('movie_batches').select('movie_key, posted');
+      const postedKeys = new Set(
+        (existing || []).filter((e) => e.posted === true).map((e) => e.movie_key)
+      );
 
-      // Filter unposted & Sort Ascending by Year (Oldest first, Newest at bottom)
+      // Skip already posted & Sort Ascending by Year (Oldest first, Newest at bottom)
       const pendingEntries = Array.from(groups.entries())
         .filter(([key]) => {
           if (postedKeys.has(key)) return false;
@@ -887,8 +916,8 @@ bot.command('autopost', async (ctx) => {
       }
 
       const statusMsg = stopAutoPostFlag
-        ? `🛑 Auto-Post Stopped! Total posted so far: <b>${postedCount}</b>`
-        : `✅ Year-Wise Auto-Post Complete! Total new posts: <b>${postedCount}</b>`;
+        ? `🛑 Auto-Post Stopped! Total remaining posted: <b>${postedCount}</b>`
+        : `✅ Remaining Auto-Post Complete! Total new posts: <b>${postedCount}</b>`;
       await ctx.reply(statusMsg, { parse_mode: 'HTML' }).catch(() => {});
     } catch (err) {
       console.error('Auto-Post Error:', err.message);
@@ -900,7 +929,7 @@ bot.command('autopost', async (ctx) => {
   })();
 });
 
-// ================= REAL-TIME AUTO-INDEX + AUTO-POST =================
+// ================= REAL-TIME AUTO-INDEX + TOGGLEABLE LIVE CHANNEL UPDATE =================
 async function processRealtimeBatch(movieKey) {
   const entry = pendingAutoPosts.get(movieKey);
   if (!entry) return;
@@ -1002,10 +1031,10 @@ async function processRealtimeBatch(movieKey) {
     for (const targetCh of targetChannels) {
       try {
         await sendBannerPhoto(targetCh, tmdb?.posterUrl, caption);
-        console.log(`🚀 Realtime Auto-Posted: ${finalTitle}${versionTag} -> ${targetType.toUpperCase()} (${targetCh})`);
+        console.log(`🚀 Live Channel Updated: ${finalTitle}${versionTag} -> ${targetType.toUpperCase()} (${targetCh})`);
         await sleep(3000);
       } catch (err) {
-        console.error(`Realtime Post failed for ${finalTitle} in ${targetCh}:`, err.message);
+        console.error(`Live Post failed for ${finalTitle} in ${targetCh}:`, err.message);
       }
     }
   } catch (err) {
@@ -1014,6 +1043,11 @@ async function processRealtimeBatch(movieKey) {
 }
 
 function scheduleRealtimeAutoPost(record) {
+  if (!realtimeAutoPostEnabled) {
+    console.log(`⏸️ DB Live Channel Update is OFF — indexed "${record.file_name}" only.`);
+    return;
+  }
+
   const meta = parseFileMeta(record.file_name);
   let entry = pendingAutoPosts.get(meta.groupKey);
 
@@ -1554,12 +1588,13 @@ if (ADMIN_ID) {
     [
       { command: 'start', description: '👑 Admin Panel' },
       { command: 'admin', description: '📋 Admin Commands' },
+      { command: 'toggleautopost', description: '⚡ ON/OFF DB Live Channel Update' },
+      { command: 'autopost', description: '🚀 Post Remaining (Year-Wise)' },
+      { command: 'stopautopost', description: '🛑 Stop Running Auto-Post' },
+      { command: 'setlink', description: '🔗 Change File Caption Link' },
       { command: 'addchannel', description: '📢 Add Category Channel' },
       { command: 'channels', description: '📺 View Channels' },
       { command: 'delchannel', description: '🗑️ Remove Channel' },
-      { command: 'setlink', description: '🔗 Change File Caption Link' },
-      { command: 'autopost', description: '🚀 Safe Year-Wise Auto-Post' },
-      { command: 'stopautopost', description: '🛑 Stop Running Auto-Post' },
       { command: 'clearposts', description: '🧹 1-Click Clear Category Channel' },
       { command: 'resetbatches', description: '🔄 Reset Posted History' },
       { command: 'adddb', description: '🗄️ Add Extra Supabase DB' },
